@@ -229,9 +229,20 @@ isolated to that one function; swapping providers later (e.g. Google Maps) means
 internals only, since every caller (`/api/geocode`, the admin locations actions) just consumes its
 `{lat, lng, formattedAddress} | null` return shape.
 
-**Known gap, not fixed:** `/api/geocode` is necessarily public (anonymous customers call it) with no
-rate limiting — same class of issue as the pre-fix `/onboard` below, lower stakes (Mapbox quota cost,
-not account creation).
+**Live address autocomplete** (`/api/geocode/suggest`, `suggestAddresses()` in `src/lib/geocode.ts`):
+`LocationPicker.tsx`'s typed-address field debounces input (300ms, 3+ chars) and shows a dropdown of
+up to 5 Mapbox suggestions (`autocomplete=true&limit=5`), each already carrying `lat`/`lng` — picking
+one resolves immediately, no second lookup. This is separate from the one-shot `/api/geocode` (POST)
+used by "Use this address", which stays as the fallback for when a user types a full address and
+doesn't pick a suggestion. Verified the debounced fetch fires correctly end-to-end (network log
+showed the request), but the actual suggestion *results* are unverified against real Mapbox data — no
+`MAPBOX_TOKEN` has been available in this dev environment yet, so `suggestAddresses()`'s only
+exercised path so far is its own graceful-empty-results fallback, not real API responses.
+
+**Known gap, not fixed:** `/api/geocode` and `/api/geocode/suggest` are necessarily public (anonymous
+customers call them) with no rate limiting — same class of issue as the pre-fix `/onboard` below,
+lower stakes (Mapbox quota cost, not account creation) but worse for `/suggest` specifically since it
+fires per keystroke rather than once per checkout.
 
 **Known gotcha (same trap as `menu_categories`):** `restaurant_locations.sort_order` defaults to `0`,
 so newly-added locations render **first** in the admin list, not last — the admin query orders by

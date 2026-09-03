@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { haversineDistanceKm } from "@/lib/geo";
 import type { RestaurantLocation } from "@/lib/types";
 
@@ -10,6 +10,8 @@ export type ResolvedLocation = {
   lng: number;
   distanceKm: number;
 };
+
+type Suggestion = { lat: number; lng: number; formattedAddress: string };
 
 function storageKey(slug: string) {
   return `ordernest_location_${slug}`;
@@ -57,6 +59,29 @@ export function LocationPicker({
   const [address, setAddress] = useState("");
   const [loading, setLoading] = useState<"geo" | "address" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const requestIdRef = useRef(0);
+
+  useEffect(() => {
+    setShowSuggestions(true);
+    const query = address.trim();
+    if (query.length < 3) {
+      setSuggestions([]);
+      return;
+    }
+    const requestId = ++requestIdRef.current;
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/geocode/suggest?q=${encodeURIComponent(query)}`);
+        const data = await res.json();
+        if (requestId === requestIdRef.current) setSuggestions(data.results ?? []);
+      } catch {
+        if (requestId === requestIdRef.current) setSuggestions([]);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [address]);
 
   function resolve(point: { lat: number; lng: number }) {
     const best = nearestLocation(locations, point);
@@ -88,6 +113,13 @@ export function LocationPicker({
       },
       { timeout: 8000 },
     );
+  }
+
+  function selectSuggestion(suggestion: Suggestion) {
+    setAddress(suggestion.formattedAddress);
+    setShowSuggestions(false);
+    setSuggestions([]);
+    resolve({ lat: suggestion.lat, lng: suggestion.lng });
   }
 
   async function useTypedAddress() {
@@ -128,12 +160,32 @@ export function LocationPicker({
       </button>
 
       <div className="mt-4 flex gap-2">
-        <input
-          value={address}
-          onChange={(e) => setAddress(e.target.value)}
-          placeholder="Or enter your address"
-          className="flex-1 rounded-md border border-neutral-300 px-3 py-2 text-sm"
-        />
+        <div className="relative flex-1">
+          <input
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            onFocus={() => setShowSuggestions(true)}
+            onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
+            placeholder="Or enter your address"
+            className="w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
+          />
+          {showSuggestions && suggestions.length > 0 && (
+            <ul className="absolute z-10 mt-1 w-full rounded-md border border-neutral-200 bg-white text-sm shadow-lg">
+              {suggestions.map((suggestion, i) => (
+                <li key={i}>
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => selectSuggestion(suggestion)}
+                    className="w-full px-3 py-2 text-left hover:bg-neutral-50"
+                  >
+                    {suggestion.formattedAddress}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
         <button
           type="button"
           onClick={useTypedAddress}
