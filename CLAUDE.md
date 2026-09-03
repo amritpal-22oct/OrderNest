@@ -294,6 +294,16 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
 - `/admin/[slug]` and `/admin/[slug]/login` — restaurant admin orders dashboard (**built**:
   email/password login via Supabase Auth, orders list with status updates, RLS-gated).
   Also shows a "Connect Stripe" banner/button when `stripe_onboarding_complete` is false.
+  Search/filter (customer name via `ilike`, date range, status, fulfillment mode, and location when
+  the restaurant has any) plus pagination (20/page, `range()` + `{count:"exact"}`) all live in plain
+  `?query` params via a GET `<form>` — no client JS, no Server Action, just navigation, so it's
+  bookmarkable/shareable and works identically to every other filtered listing in the app. Date
+  filtering treats the `from`/`to` boundaries as UTC rather than the restaurant's own `timezone` —
+  an acknowledged simplification (a restaurant far from UTC can see a day's orders spill a few hours
+  into the adjacent calendar day); this is a search convenience, not an enforcement path like
+  hours-of-operation, so the extra precision wasn't worth the complexity. Verified end-to-end via
+  browser against real `mithaas-cafe` orders (each filter individually and combined) and against a
+  throwaway 25-order seed for pagination (page 1 of 2 → page 2, correct "Showing X–Y of Z" counts).
 - `/admin/[slug]/connect/return` and `/admin/[slug]/connect/refresh` — Stripe's hosted-onboarding
   redirect targets (**built**, see Stripe Connect section above)
 - `/onboard` — **built, platform-admin-gated** (not public self-serve — see "Not built yet" for why):
