@@ -6,9 +6,12 @@ import type { RestaurantLocation } from "@/lib/types";
 
 export type ResolvedLocation = {
   locationId: string;
-  lat: number;
-  lng: number;
-  distanceKm: number;
+  lat: number | null;
+  lng: number | null;
+  // null = picked directly from the list, no real coordinates — delivery
+  // radius can't be checked, so it's only usable when the restaurant has no
+  // radius configured (see CheckoutForm's deliveryAllowed).
+  distanceKm: number | null;
 };
 
 type Suggestion = { lat: number; lng: number; formattedAddress: string };
@@ -122,6 +125,16 @@ export function LocationPicker({
     resolve({ lat: suggestion.lat, lng: suggestion.lng });
   }
 
+  function selectDirectly(location: RestaurantLocation) {
+    const result: ResolvedLocation = { locationId: location.id, lat: null, lng: null, distanceKm: null };
+    try {
+      window.localStorage.setItem(storageKey(slug), JSON.stringify(result));
+    } catch {
+      // ignore
+    }
+    onResolved(result);
+  }
+
   async function useTypedAddress() {
     if (address.trim().length < 4) {
       setError("Please enter a more complete address.");
@@ -197,6 +210,29 @@ export function LocationPicker({
       </div>
 
       {error && <p className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+
+      <div className="mt-6 border-t border-neutral-100 pt-4">
+        <p className="text-sm text-neutral-500">Or choose a location directly (pickup, or delivery with no distance limit):</p>
+        <div className="mt-2 space-y-2">
+          {locations.map((location) => (
+            <div key={location.id} className="flex items-center justify-between rounded-md border border-neutral-200 px-3 py-2">
+              <div>
+                <p className="text-sm font-medium text-neutral-900">{location.name}</p>
+                <p className="text-xs text-neutral-500">
+                  {location.address_line1}, {location.city}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => selectDirectly(location)}
+                className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:border-neutral-400"
+              >
+                Select
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

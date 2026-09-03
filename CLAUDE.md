@@ -215,6 +215,18 @@ always-visible typed-address field falls back to `POST /api/geocode` (server-sid
 `haversineDistanceKm()` (`src/lib/geo.ts`) client-side. Result persists to
 `localStorage["ordernest_location_" + slug]` (same convention as `ordernest_cart_<slug>`).
 
+**Or choose a location directly** (same component, below the geolocation/address UI) — a plain list
+with a "Select" button per location, no coordinates involved (`ResolvedLocation.lat/lng/distanceKm`
+all `null` for this path — the type is `number | null`, not `number`, specifically to represent this).
+Safe by construction: `deliveryAllowed`'s existing `(resolvedLocation?.distanceKm ?? Infinity) <=
+radius` check already treats "unknown distance" as "outside any configured radius", so direct-select
+only enables delivery when `delivery_radius_km` is `null` (unlimited) — otherwise it's pickup-only,
+with an inline prompt to share location instead if the customer wants delivery. `/api/checkout`
+mirrors this: coordinates are required **only inside the `delivery_radius_km != null` branch**, not
+unconditionally, so a direct-selected unlimited-radius delivery order needs no coordinates at all
+server-side either. Verified via curl: direct-select + delivery succeeds with unlimited radius and no
+coordinates, 400s with a radius configured and no coordinates, and pickup always succeeds regardless.
+
 **Server-side re-validation is mandatory, like pricing.** `/api/checkout` re-fetches active locations
 and re-runs the same distance check server-side before creating the Stripe session — a tampered
 request can't force a delivery order outside the radius just because the client-side picker allowed
@@ -255,8 +267,8 @@ Per-restaurant, per-day-of-week schedule (`restaurant_hours`: `day_of_week` 0=Su
 default `America/Toronto`). Enforced, not just informational: `/r/[slug]/checkout` blocks with a
 "currently closed" screen server-side, `/api/checkout` independently re-checks and rejects with 400
 (same "never trust the client alone" pattern as the delivery-radius check — a checkout page loaded
-before closing time could still submit after), and the menu page (`/r/[slug]`) shows a non-blocking
-amber banner so browsing still works while closed.
+before closing time could still submit after), and the menu page (`/r/[slug]/order`) shows a
+non-blocking amber banner so browsing still works while closed.
 
 **No rows at all = always open** — the load-bearing backward-compatibility rule, identical in spirit
 to "zero locations = skip entirely": every existing tenant (e.g. `mithaas-cafe`) has no
@@ -276,12 +288,26 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
 
 ## Planned routes
 
-- `/r/[slug]` — public ordering page per restaurant (**built**: menu browsing by
-  category, qty steppers, cart drawer with live subtotal/delivery/tax/total computed
-  from that restaurant's `tax_rate`/`delivery_fee_cents`/`free_delivery_threshold_cents`.
-  Cart persists client-side in `localStorage` under `ordernest_cart_<slug>`, scoped per
-  tenant. `src/app/r/[slug]/page.tsx` fetches restaurant+menu server-side and hands it
-  to the client component `RestaurantMenu.tsx`, which owns all cart state.)
+- `/r/[slug]` — **built**: public landing page per restaurant (`src/app/r/[slug]/page.tsx`, server
+  component, no client JS). Brand-color gradient hero (`restaurant.brand_color` → dark, no photo
+  pipeline exists yet — see "Not built yet"), name/description, today's open/closed status
+  (`isRestaurantOpen`/`getTodayHours`, only shown if hours are configured), a location-count or
+  single-address summary (only shown if any `restaurant_locations` exist), and an "Order Now" CTA
+  into `/r/[slug]/order`. Every section degrades to nothing (not a placeholder) when the restaurant
+  hasn't configured that data — verified against `mithaas-cafe` (zero hours, zero locations) still
+  rendering a clean, complete-looking page.
+- `/r/[slug]/order` — **built**: the actual menu/cart page (moved here from `/r/[slug]` when the
+  landing page was added — same `RestaurantMenu.tsx` client component, unchanged cart/pricing logic,
+  `localStorage` key still `ordernest_cart_<slug>`). Header now also shows today's hours/open-status
+  and a location summary when configured (passed down from `order/page.tsx`, reusing the same
+  `isRestaurantOpen`/`getTodayHours` helpers as the landing page and the checkout hours-gate). A
+  client-side search box filters items by name/description before grouping into categories — cheap
+  (`Array.prototype.filter`, no new dependency), not a replacement for a real search index, fine at
+  a single-restaurant menu's scale. Every other page's "back to menu"/"order again" link now points
+  here instead of `/r/[slug]` (checkout's two blocking screens, success page, CheckoutForm's
+  empty-cart screen) — grep for `` `/r/${slug}` `` (or `restaurant.slug`) if you add a new one and
+  aren't sure which of the two it should point to: the landing page for "start over", `/order` for
+  "back to ordering".
 - `/r/[slug]/checkout` — **built**: contact/delivery form (`CheckoutForm.tsx`) → `POST
   /api/checkout` prices the cart server-side and creates a destination-charge embedded
   Checkout Session → mounts inline via Stripe.js. Falls back to a "coming soon" notice if
@@ -388,4 +414,20 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
    (emoji only today), no custom domain support.
 6. Automated tests — none yet (all verification so far has been manual/live browser + DB checks, plus
    one one-off `npx tsx` script for `isRestaurantOpen()`'s edge cases — not a committed test file).
+7. **Ordering-flow gaps found by benchmarking against sardarji.ca** (a real multi-location Indian
+   restaurant site, researched live this session — see the git log around the landing-page commit for
+   the full comparison). Implemented from that research: the `/r/[slug]` landing page, hours/location
+   shown on the order page, menu search, and the direct-location-select list. Still open, roughly in
+   the order a customer would notice them:
+   - No real scheduled ordering — pickup time is a fixed 4-option dropdown (`CheckoutForm.tsx`), no
+     date picker, and delivery has no timing selection at all. No prep-time estimate either.
+   - No per-item special instructions — only one restaurant-wide delivery-instructions field exists;
+     nothing for pickup orders, nothing per line item.
+   - No promo/coupon code system.
+   - Menu is flat scrolling sections; no sticky category sidebar nav (sardarji.ca has one with
+     per-category item counts) — search (built) covers some of the same need but doesn't replace it
+     for a large menu.
+   - `menu_items.image_url` exists in the schema but is never read by any page, and there's no admin
+     upload for it (or for `restaurants.logo_url`) — menu items only ever show `emoji`. This is also
+     why the landing hero is brand-color/typography rather than photography.
 

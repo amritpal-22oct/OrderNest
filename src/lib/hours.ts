@@ -54,3 +54,11 @@ export function getTodayHours(hours: RestaurantHours[], timezone: string, now: D
   const { dayOfWeek } = localParts(timezone, now);
   return hours.find((h) => h.day_of_week === dayOfWeek) ?? null;
 }
+
+// "14:30:00" -> "2:30 PM", for display only (never used in the open/closed comparisons above).
+export function formatTimeLabel(time: string): string {
+  const [h, m] = time.split(":").map(Number);
+  const period = h >= 12 ? "PM" : "AM";
+  const hour12 = h % 12 === 0 ? 12 : h % 12;
+  return `${hour12}:${String(m).padStart(2, "0")} ${period}`;
+}

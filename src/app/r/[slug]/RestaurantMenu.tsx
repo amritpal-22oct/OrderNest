@@ -25,15 +25,20 @@ export function RestaurantMenu({
   categories,
   items,
   isOpen,
+  hoursLabel,
+  locationSummary,
 }: {
   restaurant: Restaurant;
   categories: MenuCategory[];
   items: MenuItem[];
   isOpen: boolean;
+  hoursLabel?: string | null;
+  locationSummary?: string | null;
 }) {
   const [cart, setCart] = useState<Cart>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [hydrated, setHydrated] = useState(false);
+  const [search, setSearch] = useState("");
 
   // Cart lives in localStorage per-restaurant so it survives a refresh but
   // never leaks between tenants. Read only after mount to avoid SSR/client
@@ -76,23 +81,43 @@ export function RestaurantMenu({
     });
   }
 
+  const filteredItems = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter(
+      (item) => item.name.toLowerCase().includes(q) || item.description?.toLowerCase().includes(q),
+    );
+  }, [items, search]);
+
   const itemsByCategory = useMemo(() => {
     const map = new Map<string, MenuItem[]>();
-    for (const item of items) {
+    for (const item of filteredItems) {
       const key = item.category_id ?? "uncategorized";
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(item);
     }
     return map;
-  }, [items]);
+  }, [filteredItems]);
+
+  const noSearchResults = search.trim().length > 0 && filteredItems.length === 0;
 
   return (
     <div className="min-h-screen bg-neutral-50 pb-24">
       <header className="border-b border-neutral-200 bg-white">
         <div className="mx-auto flex max-w-4xl items-center justify-between px-6 py-5">
           <div>
+            <Link href={`/r/${restaurant.slug}`} className="text-xs font-medium text-neutral-400 hover:text-neutral-600">
+              ← Home
+            </Link>
             <h1 className="text-xl font-semibold text-neutral-900">{restaurant.name}</h1>
             {restaurant.description && <p className="text-sm text-neutral-500">{restaurant.description}</p>}
+            {(hoursLabel || locationSummary) && (
+              <p className="mt-1 text-xs text-neutral-400">
+                {hoursLabel}
+                {hoursLabel && locationSummary && " · "}
+                {locationSummary}
+              </p>
+            )}
           </div>
           <button
             onClick={() => setDrawerOpen(true)}
@@ -117,8 +142,19 @@ export function RestaurantMenu({
       )}
 
       <main className="mx-auto max-w-4xl px-6 py-8">
+        {categories.length > 0 && (
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search menu…"
+            className="mb-6 w-full rounded-full border border-neutral-300 px-4 py-2.5 text-sm focus:border-neutral-500 focus:outline-none"
+          />
+        )}
+
         {categories.length === 0 ? (
           <p className="text-sm text-neutral-500">This restaurant hasn&apos;t added a menu yet.</p>
+        ) : noSearchResults ? (
+          <p className="text-sm text-neutral-500">No items match &quot;{search}&quot;.</p>
         ) : (
           categories.map((category) => {
             const categoryItems = itemsByCategory.get(category.id) ?? [];

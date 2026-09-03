@@ -92,10 +92,14 @@ export async function POST(request: NextRequest) {
       if (!resolvedLocation.supports_delivery) {
         return NextResponse.json({ error: `${resolvedLocation.name} doesn't offer delivery.` }, { status: 400 });
       }
-      if (typeof customerLat !== "number" || typeof customerLng !== "number") {
-        return NextResponse.json({ error: "Missing delivery location" }, { status: 400 });
-      }
+      // Coordinates are only needed to check a radius that's actually
+      // configured — a location picked directly from the list (no real
+      // customer coordinates) is still valid for delivery when the
+      // restaurant has no radius restriction at all.
       if (restaurant.delivery_radius_km != null) {
+        if (typeof customerLat !== "number" || typeof customerLng !== "number") {
+          return NextResponse.json({ error: "Missing delivery location" }, { status: 400 });
+        }
         const distanceKm = haversineDistanceKm({ lat: customerLat, lng: customerLng }, resolvedLocation);
         if (distanceKm > restaurant.delivery_radius_km) {
           return NextResponse.json(

@@ -165,7 +165,7 @@ export function CheckoutForm({
       <div className="flex min-h-screen items-center justify-center bg-neutral-50 px-4">
         <div className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 text-center shadow-sm">
           <h1 className="text-lg font-semibold text-neutral-900">Your cart is empty</h1>
-          <Link href={`/r/${restaurant.slug}`} className="mt-4 inline-block text-sm font-medium text-neutral-900 underline">
+          <Link href={`/r/${restaurant.slug}/order`} className="mt-4 inline-block text-sm font-medium text-neutral-900 underline">
             ← Back to menu
           </Link>
         </div>
@@ -243,9 +243,11 @@ export function CheckoutForm({
 
               {needsPicker && !deliveryAllowed && activeLocation && (
                 <p className="mt-2 text-sm text-amber-700">
-                  {activeLocation.supports_delivery
-                    ? `You're ${resolvedLocation?.distanceKm.toFixed(1)} km from ${activeLocation.name} — outside our ${restaurant.delivery_radius_km}km delivery area, but pickup is available there.`
-                    : `${activeLocation.name} doesn't offer delivery — pickup only.`}
+                  {!activeLocation.supports_delivery
+                    ? `${activeLocation.name} doesn't offer delivery — pickup only.`
+                    : resolvedLocation?.distanceKm != null
+                      ? `You're ${resolvedLocation.distanceKm.toFixed(1)} km from ${activeLocation.name} — outside our ${restaurant.delivery_radius_km}km delivery area, but pickup is available there.`
+                      : `Share your location above to check delivery availability at ${activeLocation.name}, or choose pickup.`}
                 </p>
               )}
 

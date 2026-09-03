@@ -102,7 +102,7 @@ export default async function SuccessPage({
         </div>
 
         <Link
-          href={`/r/${slug}`}
+          href={`/r/${slug}/order`}
           className="mt-8 block rounded-full bg-neutral-900 py-3 text-center text-sm font-medium text-white"
         >
           Order again
@@ -125,7 +125,7 @@ function NoOrder({ slug, restaurantName }: { slug: string; restaurantName: strin
     <Centered>
       <h1 className="text-lg font-semibold text-neutral-900">No recent order found</h1>
       <p className="mt-2 text-sm text-neutral-500">Looks like you haven&apos;t placed an order at {restaurantName} yet.</p>
-      <Link href={`/r/${slug}`} className="mt-6 inline-block text-sm font-medium text-neutral-900 underline">
+      <Link href={`/r/${slug}/order`} className="mt-6 inline-block text-sm font-medium text-neutral-900 underline">
         ← Back to menu
       </Link>
     </Centered>

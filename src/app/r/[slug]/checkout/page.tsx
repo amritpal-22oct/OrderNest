@@ -20,7 +20,7 @@ export default async function CheckoutPage({ params }: { params: Promise<{ slug:
           <p className="mt-2 text-sm text-neutral-500">
             {restaurant.name} isn&apos;t accepting online payments yet.
           </p>
-          <Link href={`/r/${slug}`} className="mt-6 inline-block text-sm font-medium text-neutral-900 underline">
+          <Link href={`/r/${slug}/order`} className="mt-6 inline-block text-sm font-medium text-neutral-900 underline">
             ← Back to menu
           </Link>
         </div>
@@ -40,7 +40,7 @@ export default async function CheckoutPage({ params }: { params: Promise<{ slug:
         <div className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 text-center shadow-sm">
           <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name} is currently closed</h1>
           <p className="mt-2 text-sm text-neutral-500">Please check back during our operating hours.</p>
-          <Link href={`/r/${slug}`} className="mt-6 inline-block text-sm font-medium text-neutral-900 underline">
+          <Link href={`/r/${slug}/order`} className="mt-6 inline-block text-sm font-medium text-neutral-900 underline">
             ← Back to menu
           </Link>
         </div>
