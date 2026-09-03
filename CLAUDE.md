@@ -9,7 +9,9 @@ serves many restaurants, each with their own branded ordering page, menu, and
 order dashboard. In Stripe's own terminology this **is a Marketplace** (not a
 "SaaS platform" — see Stripe Connect section below): OrderNest runs checkout
 and is merchant of record, restaurants receive payouts as connected accounts,
-and the platform earns a cut via `application_fee_amount`. No cross-restaurant
+and OrderNest takes **no cut** — purely a payment facilitator, not a revenue
+share (see Checkout & webhook section for how `application_fee_amount` is
+still used, as a Stripe-fee pass-through, not platform revenue). No cross-restaurant
 discovery/browsing though — each restaurant's ordering page is reached
 directly by its own slug, not surfaced in a marketplace-style directory.
 
@@ -26,8 +28,8 @@ client never touches card data or secret keys).
 - **Next.js 16** (App Router, TypeScript, Tailwind), `src/` layout, deployed to Vercel (planned)
 - **Supabase**: Postgres + Auth + Row Level Security — project `bccjapzfqkwkxiqxlelv` (see `.env.local`, gitignored)
 - **Stripe Connect** (Accounts v2, `recipient` configuration, `dashboard: "express"`) — each
-  restaurant onboards its own connected account via hosted onboarding; platform takes a cut
-  via `application_fee_amount` — see "Stripe Connect" section below before touching this code
+  restaurant onboards its own connected account via hosted onboarding; platform takes no cut
+  (see "Stripe Connect" section below before touching this code)
 - MCP servers available in this session: `supabase` (schema/migrations/queries) and
   Stripe's official plugin MCP (`plugin:stripe:stripe`) — note its `stripe_api_search`/
   `stripe_api_details` tools don't have the v2 Core endpoints indexed yet; for those, either
@@ -67,6 +69,9 @@ everything downstream:
 - Checkout Sessions must use **destination charges** (`payment_intent_data.transfer_data.destination`
   + `application_fee_amount`) — **not `on_behalf_of`**, which is for SaaS/direct-charge platforms
   and is explicitly wrong for a standard marketplace flow. **Built** — see `src/app/api/checkout/route.ts`.
+  `application_fee_amount` here is a **Stripe-fee pass-through, not platform revenue** — OrderNest
+  takes no cut (explicit product decision); see the Checkout & webhook section for why
+  `application_fee_amount` still has to be set to something even at 0% platform take.
 
 **Capability check uses the v2 path, not deprecated v1 fields:**
 `account.configuration.recipient.capabilities.stripe_balance.stripe_transfers.status === "active"`
@@ -77,9 +82,38 @@ retrieve, since v2 nested config isn't returned by default. This lives in
 **Capability activation lags the onboarding redirect by a couple seconds** — a same-request
 check right after `return_url` can read a stale non-active status even though the account is
 genuinely fine seconds later. The return route retries a few times with a short delay to paper
-over this, but the real fix (not yet built) is a Connect webhook listening for
-`v2.core.account[requirements].updated` and updating `restaurants.stripe_onboarding_complete`
-from that event instead of trusting a single synchronous check.
+over this (confirmed for real in testing: the return route's redirect took ~6s, i.e. it needed
+multiple retries before the status actually flipped). The durable fix, **built**, is a separate
+Connect thin-events webhook — see its own section below.
+
+### Connect thin-events webhook (`src/app/api/webhooks/stripe-connect/route.ts`)
+
+Accounts v2 delivers account-change notifications through an entirely different mechanism from
+classic v1 webhooks: **Event Destinations** + **thin events**, not the `checkout.session.completed`-style
+snapshot events. Don't assume the same webhook pattern applies — verified this the hard way via
+`search_stripe_documentation` before writing any code, since guessing here would've meant a third
+Connect-related rewrite.
+
+- Event type: `v2.core.account[configuration.recipient].capability_status_updated` (fires
+  specifically when a recipient capability like `stripe_transfers` changes status — more precise
+  than the broader `[requirements].updated`).
+- Verified with `stripe.parseEventNotificationAsync(rawBody, signature, secret)`, **not**
+  `stripe.webhooks.constructEvent()` — a distinct method for thin events.
+- The notification payload is tiny (`related_object.id` = the account id, plus the event type) —
+  full account details (needed for the capability status) are fetched separately via
+  `stripe.v2.core.accounts.retrieve(accountId, { include: ["configuration.recipient"] })`, same
+  call as the return route uses.
+- **Separate signing secret** from the v1 checkout webhook: `STRIPE_CONNECT_WEBHOOK_SECRET` in
+  `.env.local`, distinct from `STRIPE_WEBHOOK_SECRET`. In production these come from two separate
+  Event Destinations (different `event_payload`: `snapshot` vs `thin`); locally, a single
+  `stripe listen` session signs both with the same value — see Local dev section for the actual
+  command.
+- **Verified working end-to-end** (not just type-checked): created a throwaway restaurant,
+  onboarded a fresh Connect account for it through the real hosted flow, and watched both the
+  thin event fire (`stripe-listen` log showed 3 deliveries, all `200`) and
+  `restaurants.stripe_onboarding_complete` flip to `true` from the webhook path independently of
+  the return-route retry. Cleaned up the throwaway restaurant after — don't be surprised it's gone
+  from the DB, that's expected, not a sign the feature is untested.
 
 **Test-mode onboarding is fast**: the hosted onboarding flow has one-click shortcuts —
 "Use test phone number" / "Use test code" for phone verification, and "Use test account" on
@@ -116,9 +150,18 @@ exist. Applies to any future embedded-Checkout mount point, not just this one.
 the client-submitted cart is just `{item_id: quantity}`; prices, delivery fee, and tax are looked
 up/derived from the restaurant's own DB row and settings, never trusted from the request body.
 
-**Platform fee** is a flat `PLATFORM_FEE_RATE = 0.1` (10%) constant in `src/lib/stripe.ts`, applied
-as `application_fee_amount` on the destination charge. Move to a per-restaurant
-`restaurants.platform_fee_rate` column if pricing ever needs to vary.
+**No platform fee — explicit product decision** (confirmed directly, not assumed): OrderNest
+"should not [be] involve[d] in any fee... it should purely be between restaurant and stripe...
+we are just facilitating payments." A destination charge still lands on the *platform's* Stripe
+balance before transferring to the restaurant, so Stripe's own processing fee would otherwise be
+deducted from the platform, not the restaurant, by default. `application_fee_amount` is still set
+on every session — not as a cut, but as a **pass-through** equal to Stripe's own estimated fee
+(`STRIPE_FEE_PERCENT` + `STRIPE_FEE_FIXED_CENTS` in `src/lib/stripe.ts`, currently the standard
+Stripe Canada domestic-card rate, 2.9% + $0.30 — an approximation, not exact for every card
+type/currency). Net effect: platform nets ~$0 per transaction, restaurant's payout absorbs
+Stripe's fee, same as if they'd connected to Stripe directly themselves. If a real platform
+revenue model is ever wanted, this is the constant to repurpose — but don't reintroduce it without
+being asked; the zero-fee decision was deliberate, not a placeholder.
 
 **Webhook idempotency**: `orders.stripe_checkout_session_id` has a unique index (partial, only
 where not null); `fulfillOrder()` in the webhook checks for an existing row with that session id
@@ -131,15 +174,21 @@ metadata only carries the fulfillment/contact fields Stripe doesn't already have
 `delivery_address`).
 
 **Local webhook testing needs the Stripe CLI forwarding events**, since Stripe can't reach
-`localhost` directly:
+`localhost` directly. One `stripe listen` invocation forwards both the v1 checkout webhook and
+the v2 thin Connect webhook:
 ```
-stripe listen --api-key <STRIPE_SECRET_KEY> --forward-to localhost:3000/api/webhooks/stripe \
-  --events checkout.session.completed,checkout.session.async_payment_succeeded
+stripe listen --api-key <STRIPE_SECRET_KEY> \
+  --events checkout.session.completed,checkout.session.async_payment_succeeded \
+  --forward-to localhost:3000/api/webhooks/stripe \
+  --thin-events "v2.core.account[configuration.recipient].capability_status_updated" \
+  --forward-thin-to localhost:3000/api/webhooks/stripe-connect
 ```
-Installed via `brew install stripe/stripe-cli/stripe` this session. `stripe listen` prints a
-`whsec_...` signing secret on startup — put it in `.env.local` as `STRIPE_WEBHOOK_SECRET` and
-restart `next dev` (env vars aren't hot-reloaded). The signing secret is regenerated every time
-`stripe listen` restarts, so it needs updating again if the listener is ever stopped/restarted.
+Installed via `brew install stripe/stripe-cli/stripe` this session. `stripe listen` prints one
+`whsec_...` signing secret on startup, shared by both destinations in this local-forwarding mode —
+put the same value in `.env.local` as both `STRIPE_WEBHOOK_SECRET` and
+`STRIPE_CONNECT_WEBHOOK_SECRET`, then restart `next dev` (env vars aren't hot-reloaded). The
+secret is regenerated every time `stripe listen` restarts, so both vars need updating again if the
+listener is ever stopped/restarted — they'll drift out of sync if you only update one.
 
 ## Planned routes
 
@@ -156,7 +205,8 @@ restart `next dev` (env vars aren't hot-reloaded). The signing secret is regener
   section above.
 - `/r/[slug]/success` — **built**: verifies the session server-side against Stripe (never
   trusts the browser/URL), shows the confirmed order, clears the local cart.
-- `/api/checkout` and `/api/webhooks/stripe` — **built**, see Checkout & webhook section above.
+- `/api/checkout`, `/api/webhooks/stripe`, and `/api/webhooks/stripe-connect` — **built**, see
+  Checkout & webhook and Stripe Connect sections above.
 - `/admin/[slug]` and `/admin/[slug]/login` — restaurant admin orders dashboard (**built**:
   email/password login via Supabase Auth, orders list with status updates, RLS-gated).
   Also shows a "Connect Stripe" banner/button when `stripe_onboarding_complete` is false.
@@ -170,15 +220,23 @@ restart `next dev` (env vars aren't hot-reloaded). The signing secret is regener
 ## Local dev
 
 - Env vars in `.env.local` (gitignored): Supabase and Stripe keys are all filled in, including
-  `STRIPE_WEBHOOK_SECRET` — but that value is tied to a running `stripe listen` process (see
-  Checkout & webhook section above) and needs regenerating if the listener restarts.
+  `STRIPE_WEBHOOK_SECRET` and `STRIPE_CONNECT_WEBHOOK_SECRET` — both tied to a running
+  `stripe listen` process (see Checkout & webhook section above) and both need regenerating
+  together if the listener restarts.
 - `npm run dev` — note: Next 16 made route `params` an async `Promise` even in
   Server *and* Client Component pages (unwrap with `await params` server-side, or
   `use(params)` client-side). Got bitten by this once already (silently resolved to
   `params.slug === undefined`, causing a bad redirect) — watch for it in new routes.
-- To test a real payment locally, `stripe listen` (see Checkout & webhook section above) must be
-  running alongside `next dev` — without it, payments succeed on Stripe's side but no webhook
-  ever reaches `/api/webhooks/stripe`, so no order gets persisted.
+- To test a real payment (or Connect onboarding) locally, `stripe listen` (see Checkout & webhook
+  section above, needs both `--forward-to` and `--forward-thin-to`) must be running alongside
+  `next dev` — without it, the Stripe-side action succeeds but no webhook ever reaches the app, so
+  nothing gets persisted/updated.
+- `getRestaurantBySlug` (`src/lib/restaurant.ts`) logs (rather than silently swallows) query
+  errors now — originally it destructured only `{ data }` from the Supabase response, so any
+  transient failure (auth hiccup, network blip) looked identical to "restaurant doesn't exist" and
+  produced a confusing false-negative 404 during testing. If a restaurant that definitely exists
+  ever fails to load again, check the server console for the logged error before assuming it's
+  actually missing.
 - Seeded dev data: restaurant `mithaas-cafe` (slug, id `cfc1da68-13d3-491d-a826-6c21259515c7`),
   one test admin user — `admin@mithaascafe.test` / `TestAdmin123!` (local Supabase dev
   project only, not a real secret) — full menu (4 categories, 17 items, ported from the
@@ -189,11 +247,8 @@ restart `next dev` (env vars aren't hot-reloaded). The signing secret is regener
 
 ## Not built yet (in rough priority order)
 
-1. Connect account-requirements webhook (`v2.core.account[requirements].updated`) so
-   `stripe_onboarding_complete` stays accurate without relying on the return-route's
-   synchronous retry-check
-2. Restaurant onboarding flow (`/onboard`) — new tenant signup, distinct from Stripe
+1. Restaurant onboarding flow (`/onboard`) — new tenant signup, distinct from Stripe
    Connect onboarding (already built, per-restaurant)
-3. Menu management UI for restaurant admins
-4. Platform-admin cross-restaurant view
+2. Menu management UI for restaurant admins
+3. Platform-admin cross-restaurant view
 

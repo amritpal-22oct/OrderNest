@@ -27,6 +27,10 @@
 # IDE
 .idea/
 
+# Claude Code local session/worktree metadata (can contain other agents'
+# in-progress worktrees with their own .env files — never commit this)
+.claude/
+
 # debug
 npm-debug.log*
 yarn-debug.log*

@@ -4,7 +4,13 @@ import type { Restaurant } from "@/lib/types";
 
 export async function getRestaurantBySlug(slug: string): Promise<Restaurant | null> {
   const supabase = await createClient();
-  const { data } = await supabase.from("restaurants").select("*").eq("slug", slug).maybeSingle();
+  const { data, error } = await supabase.from("restaurants").select("*").eq("slug", slug).maybeSingle();
+  if (error) {
+    // A real query failure (auth/session hiccup, network blip, etc.) looks
+    // identical to "no such restaurant" if we only check `data` — surface it
+    // instead of silently treating every failure as a 404.
+    console.error(`getRestaurantBySlug(${slug}) failed:`, error);
+  }
   return data;
 }
 

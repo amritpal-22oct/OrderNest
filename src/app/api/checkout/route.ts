@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { stripe, PLATFORM_FEE_RATE } from "@/lib/stripe";
+import { stripe, STRIPE_FEE_PERCENT, STRIPE_FEE_FIXED_CENTS } from "@/lib/stripe";
 import { priceCart } from "@/lib/cart-pricing";
 import type { Restaurant } from "@/lib/types";
 
@@ -81,7 +81,10 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  const applicationFeeAmount = Math.round(priced.totalCents * PLATFORM_FEE_RATE);
+  // Pass-through only, not platform revenue — see src/lib/stripe.ts. Nets to
+  // ~$0 for the platform; the restaurant's payout absorbs Stripe's own fee,
+  // same as if they'd connected to Stripe directly.
+  const stripeFeePassThroughCents = Math.round(priced.totalCents * STRIPE_FEE_PERCENT) + STRIPE_FEE_FIXED_CENTS;
   const origin = request.headers.get("origin") ?? new URL(request.url).origin;
 
   try {
@@ -93,7 +96,7 @@ export async function POST(request: NextRequest) {
       return_url: `${origin}/r/${slug}/success?session_id={CHECKOUT_SESSION_ID}`,
       integration_identifier: `ordernest-checkout-${randomLetters(8)}`,
       payment_intent_data: {
-        application_fee_amount: applicationFeeAmount,
+        application_fee_amount: stripeFeePassThroughCents,
         transfer_data: { destination: restaurant.stripe_account_id },
       },
       metadata: {
