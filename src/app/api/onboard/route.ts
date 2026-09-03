@@ -4,6 +4,8 @@ import { createClient } from "@/lib/supabase/server";
 import { isPlatformAdmin } from "@/lib/platform-admin";
 
 const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const MAX_LOGO_BYTES = 5 * 1024 * 1024;
+const ALLOWED_LOGO_TYPES: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
 
 // Creates a brand-new tenant: the restaurants row, a Supabase Auth user, and
 // the restaurant_admins link making that user its owner. All three only via
@@ -30,18 +32,28 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Not authorized" }, { status: 403 });
   }
 
-  let body: { restaurantName?: string; slug?: string; ownerName?: string; email?: string; password?: string };
+  // multipart/form-data, not JSON — carries the optional logo file alongside
+  // the text fields in one request.
+  let form: FormData;
   try {
-    body = await request.json();
+    form = await request.formData();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+    return NextResponse.json({ error: "Invalid form data" }, { status: 400 });
   }
 
-  const restaurantName = body.restaurantName?.trim();
-  const slug = body.slug?.trim().toLowerCase();
-  const ownerName = body.ownerName?.trim();
-  const email = body.email?.trim();
-  const password = body.password;
+  const restaurantName = (form.get("restaurantName") as string | null)?.trim();
+  const slug = (form.get("slug") as string | null)?.trim().toLowerCase();
+  const ownerName = (form.get("ownerName") as string | null)?.trim();
+  const email = (form.get("email") as string | null)?.trim();
+  const password = form.get("password") as string | null;
+  const logo = form.get("logo");
+  const logoFile = logo instanceof File && logo.size > 0 ? logo : null;
+
+  if (logoFile) {
+    const ext = ALLOWED_LOGO_TYPES[logoFile.type];
+    if (!ext) return NextResponse.json({ error: "Logo must be a JPEG, PNG, or WebP image" }, { status: 400 });
+    if (logoFile.size > MAX_LOGO_BYTES) return NextResponse.json({ error: "Logo must be 5MB or smaller" }, { status: 400 });
+  }
 
   if (!restaurantName || restaurantName.length < 2) {
     return NextResponse.json({ error: "Restaurant name is too short" }, { status: 400 });
@@ -98,6 +110,30 @@ export async function POST(request: NextRequest) {
     await supabase.from("restaurants").delete().eq("id", restaurant.id);
     await supabase.auth.admin.deleteUser(userId);
     return NextResponse.json({ error: adminLinkError.message }, { status: 500 });
+  }
+
+  // Logo upload happens last and is best-effort: it needs restaurant.id for
+  // the storage path (same {restaurant_id}/{uuid}.{ext} convention as
+  // menu-item-images), so it can't happen before the insert above, and a
+  // failure here is cosmetic — not worth unwinding an otherwise-successful
+  // signup over. Uses the service-role client (already in scope as `supabase`),
+  // not the browser-upload pattern ImageUploadField.tsx uses, since the
+  // uploading platform admin isn't a restaurant_admin of the brand-new
+  // restaurant yet and the RLS policies on this bucket couldn't authorize it.
+  if (logoFile) {
+    try {
+      const ext = ALLOWED_LOGO_TYPES[logoFile.type];
+      const path = `${restaurant.id}/${crypto.randomUUID()}.${ext}`;
+      const { error: uploadError } = await supabase.storage
+        .from("restaurant-logos")
+        .upload(path, logoFile, { contentType: logoFile.type });
+      if (!uploadError) {
+        const { data: publicUrl } = supabase.storage.from("restaurant-logos").getPublicUrl(path);
+        await supabase.from("restaurants").update({ logo_url: publicUrl.publicUrl }).eq("id", restaurant.id);
+      }
+    } catch {
+      // Ignored — see comment above.
+    }
   }
 
   return NextResponse.json({ slug: restaurant.slug });

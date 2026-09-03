@@ -3,6 +3,8 @@ import { requireRestaurantAdmin } from "@/lib/restaurant";
 import type { Order, OrderStatus, RestaurantLocation } from "@/lib/types";
 import { money } from "@/lib/format";
 import { connectStripeAction, signOutAction, updateOrderStatusAction } from "./actions";
+import { CancelOrderButton } from "./CancelOrderButton";
+import { AcceptingOrdersToggle } from "./AcceptingOrdersToggle";
 
 const STATUS_STYLES: Record<OrderStatus, string> = {
   pending: "bg-neutral-100 text-neutral-700",
@@ -13,7 +15,13 @@ const STATUS_STYLES: Record<OrderStatus, string> = {
   cancelled: "bg-red-100 text-red-700",
 };
 
+// Full list, used only for the search filter — past cancelled orders should
+// still be searchable/filterable by that status.
 const STATUS_OPTIONS: OrderStatus[] = ["pending", "paid", "preparing", "ready", "completed", "cancelled"];
+// "cancelled" excluded here — see the VALID_STATUSES comment in actions.ts:
+// cancelling a real (always-paid) order must go through cancelAndRefundOrderAction,
+// never this plain per-order status dropdown.
+const SETTABLE_STATUS_OPTIONS: OrderStatus[] = ["pending", "paid", "preparing", "ready", "completed"];
 const PAGE_SIZE = 20;
 
 type SearchParams = {
@@ -24,10 +32,15 @@ type SearchParams = {
   to?: string;
   location?: string;
   page?: string;
+  cancelError?: string;
 };
 
 function buildHref(current: SearchParams, overrides: Partial<SearchParams>) {
-  const merged: SearchParams = { ...current, ...overrides };
+  // cancelError is a one-time flash message, not a real filter — drop it so
+  // paginating away doesn't drag a stale error banner along.
+  const rest = { ...current };
+  delete rest.cancelError;
+  const merged: SearchParams = { ...rest, ...overrides };
   const qs = new URLSearchParams();
   for (const [key, value] of Object.entries(merged)) {
     if (value) qs.set(key, value);
@@ -108,6 +121,7 @@ export default async function AdminOrdersPage({
             <Link href={`/admin/${slug}/promo`} className="text-sm text-neutral-500 hover:text-neutral-900">
               Promo codes
             </Link>
+            <AcceptingOrdersToggle slug={slug} acceptingOrders={restaurant.accepting_orders} />
             <form action={signOutAction}>
               <input type="hidden" name="slug" value={slug} />
               <button type="submit" className="text-sm text-neutral-500 hover:text-neutral-900">
@@ -119,6 +133,22 @@ export default async function AdminOrdersPage({
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-8">
+        {sp.cancelError && (
+          <div className="mb-6 rounded-xl border border-red-200 bg-red-50 px-5 py-4">
+            <p className="font-medium text-red-900">Couldn&apos;t cancel that order</p>
+            <p className="text-sm text-red-700">{sp.cancelError}</p>
+          </div>
+        )}
+
+        {!restaurant.accepting_orders && (
+          <div className="mb-6 rounded-xl border border-amber-200 bg-amber-50 px-5 py-4">
+            <p className="font-medium text-amber-900">Ordering is paused</p>
+            <p className="text-sm text-amber-700">
+              Customers can browse your menu but can&apos;t place new orders right now. Resume ordering above when you&apos;re ready.
+            </p>
+          </div>
+        )}
+
         {!restaurant.stripe_onboarding_complete && (
           <div className="mb-6 flex items-center justify-between rounded-xl border border-amber-200 bg-amber-50 px-5 py-4">
             <div>
@@ -144,8 +174,14 @@ export default async function AdminOrdersPage({
               placeholder="Customer name"
               className="col-span-2 rounded-md border border-neutral-300 px-2 py-1.5 text-sm sm:col-span-1"
             />
-            <input type="date" name="from" defaultValue={from} className="rounded-md border border-neutral-300 px-2 py-1.5 text-sm" />
-            <input type="date" name="to" defaultValue={to} className="rounded-md border border-neutral-300 px-2 py-1.5 text-sm" />
+            <label className="block text-xs text-neutral-500">
+              From
+              <input type="date" name="from" defaultValue={from} className="mt-1 w-full rounded-md border border-neutral-300 px-2 py-1.5 text-sm text-neutral-900" />
+            </label>
+            <label className="block text-xs text-neutral-500">
+              To
+              <input type="date" name="to" defaultValue={to} className="mt-1 w-full rounded-md border border-neutral-300 px-2 py-1.5 text-sm text-neutral-900" />
+            </label>
             <select name="status" defaultValue={status} className="rounded-md border border-neutral-300 px-2 py-1.5 text-sm">
               <option value="">All statuses</option>
               {STATUS_OPTIONS.map((s) => (
@@ -172,18 +208,18 @@ export default async function AdminOrdersPage({
           </div>
           <div className="mt-3 flex items-center gap-3">
             <button type="submit" className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm text-white hover:bg-neutral-800">
-              Filter
+              Search
             </button>
             {hasFilters && (
               <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 underline hover:text-neutral-900">
-                Clear filters
+                Clear search
               </Link>
             )}
           </div>
         </form>
 
         {!orders || orders.length === 0 ? (
-          <p className="text-sm text-neutral-500">{hasFilters ? "No orders match your filters." : "No orders yet."}</p>
+          <p className="text-sm text-neutral-500">{hasFilters ? "No orders match your search." : "No orders yet."}</p>
         ) : (
           <>
             <p className="mb-3 text-sm text-neutral-500">
@@ -206,6 +242,15 @@ export default async function AdminOrdersPage({
                         {order.status}
                       </span>
                       <p className="mt-1 text-sm text-neutral-500">{new Date(order.created_at).toLocaleString()}</p>
+                      {order.refunded_at && (
+                        <p className={`mt-1 text-xs ${order.refund_status === "failed" || order.refund_status === "canceled" ? "text-red-700 font-medium" : "text-red-600"}`}>
+                          {order.refund_status === "succeeded"
+                            ? `Refunded ${money(order.total_cents, order.currency)} on ${new Date(order.refunded_at).toLocaleDateString()}`
+                            : order.refund_status === "failed" || order.refund_status === "canceled"
+                              ? `Refund failed — money wasn't returned. Try again below.`
+                              : `Refund pending since ${new Date(order.refunded_at).toLocaleDateString()}`}
+                        </p>
+                      )}
                     </div>
                   </div>
 
@@ -238,24 +283,31 @@ export default async function AdminOrdersPage({
                     </p>
                   </div>
 
-                  <form action={updateOrderStatusAction} className="mt-4 flex items-center gap-2">
-                    <input type="hidden" name="slug" value={slug} />
-                    <input type="hidden" name="orderId" value={order.id} />
-                    <select
-                      name="status"
-                      defaultValue={order.status}
-                      className="rounded-md border border-neutral-300 px-2 py-1 text-sm"
-                    >
-                      {STATUS_OPTIONS.map((s) => (
-                        <option key={s} value={s}>
-                          {s}
-                        </option>
-                      ))}
-                    </select>
-                    <button type="submit" className="rounded-md bg-neutral-900 px-3 py-1 text-sm text-white hover:bg-neutral-800">
-                      Update
-                    </button>
-                  </form>
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    {order.status !== "cancelled" && (
+                      <form action={updateOrderStatusAction} className="flex items-center gap-2">
+                        <input type="hidden" name="slug" value={slug} />
+                        <input type="hidden" name="orderId" value={order.id} />
+                        <select
+                          name="status"
+                          defaultValue={order.status}
+                          className="rounded-md border border-neutral-300 px-2 py-1 text-sm"
+                        >
+                          {SETTABLE_STATUS_OPTIONS.map((s) => (
+                            <option key={s} value={s}>
+                              {s}
+                            </option>
+                          ))}
+                        </select>
+                        <button type="submit" className="rounded-md bg-neutral-900 px-3 py-1 text-sm text-white hover:bg-neutral-800">
+                          Update
+                        </button>
+                      </form>
+                    )}
+                    {order.refund_status !== "succeeded" &&
+                      order.refund_status !== "pending" &&
+                      order.refund_status !== "requires_action" && <CancelOrderButton slug={slug} orderId={order.id} />}
+                  </div>
                 </div>
               ))}
             </div>

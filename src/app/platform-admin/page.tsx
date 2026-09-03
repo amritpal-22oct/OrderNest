@@ -1,8 +1,37 @@
 import Link from "next/link";
 import { requirePlatformAdmin } from "@/lib/platform-admin";
 import { money } from "@/lib/format";
+import { stripe } from "@/lib/stripe";
 import type { Restaurant } from "@/lib/types";
-import { signOutAction } from "./actions";
+import { signOutAction, updateStripeCustomerIdAction, setUpPlatformBillingAction } from "./actions";
+
+// Subscriptions are created/managed by hand in the Stripe Dashboard (no
+// in-app Checkout/webhook integration by design — see stripe_customer_id
+// comment in schema.sql), so status is looked up live from Stripe rather
+// than tracked in the DB, which would drift out of sync with the Dashboard.
+const SUBSCRIPTION_STYLES: Record<string, string> = {
+  active: "bg-green-100 text-green-700",
+  trialing: "bg-blue-100 text-blue-700",
+  past_due: "bg-amber-100 text-amber-700",
+  unpaid: "bg-amber-100 text-amber-700",
+  incomplete: "bg-amber-100 text-amber-700",
+  paused: "bg-neutral-100 text-neutral-600",
+  canceled: "bg-red-100 text-red-700",
+  incomplete_expired: "bg-red-100 text-red-700",
+  none: "bg-neutral-100 text-neutral-600",
+  error: "bg-red-100 text-red-700",
+};
+
+async function lookupSubscriptionStatus(customerId: string): Promise<string> {
+  try {
+    const subs = await stripe.subscriptions.list({ customer: customerId, status: "all", limit: 1 });
+    return subs.data[0]?.status ?? "none";
+  } catch {
+    // Most likely a mistyped/deleted customer id — surface as an error badge
+    // rather than silently showing "no subscription".
+    return "error";
+  }
+}
 
 export default async function PlatformAdminPage() {
   const { supabase, user } = await requirePlatformAdmin();
@@ -24,6 +53,18 @@ export default async function PlatformAdminPage() {
     }
     statsByRestaurant.set(order.restaurant_id, stats);
   }
+
+  // Platform-billing status (cus_... on OrderNest's own account, unrelated to
+  // stripe_account_id) — fetched live per restaurant that has a customer id
+  // saved, in parallel.
+  const subscriptionStatusByRestaurant = new Map<string, string>();
+  await Promise.all(
+    (restaurants ?? [])
+      .filter((r) => r.stripe_customer_id)
+      .map(async (r) => {
+        subscriptionStatusByRestaurant.set(r.id, await lookupSubscriptionStatus(r.stripe_customer_id!));
+      }),
+  );
 
   return (
     <div className="min-h-screen bg-neutral-50">
@@ -56,6 +97,7 @@ export default async function PlatformAdminPage() {
                 <tr>
                   <th className="px-5 py-3 font-medium">Restaurant</th>
                   <th className="px-5 py-3 font-medium">Stripe</th>
+                  <th className="px-5 py-3 font-medium">Subscription</th>
                   <th className="px-5 py-3 font-medium">Orders</th>
                   <th className="px-5 py-3 font-medium">Revenue</th>
                   <th className="px-5 py-3 font-medium"></th>
@@ -78,6 +120,41 @@ export default async function PlatformAdminPage() {
                         >
                           {restaurant.stripe_onboarding_complete ? "Connected" : "Not connected"}
                         </span>
+                      </td>
+                      <td className="px-5 py-3">
+                        {restaurant.stripe_customer_id ? (
+                          <span
+                            className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                              SUBSCRIPTION_STYLES[subscriptionStatusByRestaurant.get(restaurant.id) ?? "none"]
+                            }`}
+                          >
+                            {(subscriptionStatusByRestaurant.get(restaurant.id) ?? "none").replace("_", " ")}
+                          </span>
+                        ) : (
+                          <span className="inline-block rounded-full bg-neutral-100 px-2.5 py-0.5 text-xs font-medium text-neutral-600">
+                            Not set
+                          </span>
+                        )}
+                        {!restaurant.stripe_customer_id && (
+                          <form action={setUpPlatformBillingAction} className="mt-1.5">
+                            <input type="hidden" name="restaurantId" value={restaurant.id} />
+                            <button type="submit" className="rounded bg-neutral-900 px-2 py-0.5 text-xs text-white hover:bg-neutral-800">
+                              Set up billing
+                            </button>
+                          </form>
+                        )}
+                        <form action={updateStripeCustomerIdAction} className="mt-1.5 flex items-center gap-1">
+                          <input type="hidden" name="restaurantId" value={restaurant.id} />
+                          <input
+                            name="stripeCustomerId"
+                            defaultValue={restaurant.stripe_customer_id ?? ""}
+                            placeholder="cus_..."
+                            className="w-28 rounded border border-neutral-300 px-1.5 py-0.5 font-mono text-xs text-neutral-700"
+                          />
+                          <button type="submit" className="rounded bg-neutral-100 px-2 py-0.5 text-xs text-neutral-600 hover:bg-neutral-200">
+                            Save
+                          </button>
+                        </form>
                       </td>
                       <td className="px-5 py-3 text-neutral-700">{stats.count}</td>
                       <td className="px-5 py-3 text-neutral-700">{money(stats.revenueCents, restaurant.currency)}</td>

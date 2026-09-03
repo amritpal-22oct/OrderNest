@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { stripe, STRIPE_FEE_PERCENT, STRIPE_FEE_FIXED_CENTS } from "@/lib/stripe";
+import { stripe } from "@/lib/stripe";
 import { priceCart } from "@/lib/cart-pricing";
 import { haversineDistanceKm } from "@/lib/geo";
 import { isRestaurantOpen } from "@/lib/hours";
@@ -64,15 +64,26 @@ export async function POST(request: NextRequest) {
   if (!restaurant.stripe_account_id || !restaurant.stripe_onboarding_complete) {
     return NextResponse.json({ error: "This restaurant isn't accepting payments yet" }, { status: 400 });
   }
+  // Same "never trust the client alone" pattern as every other checkout gate
+  // — a page loaded before the admin paused ordering could still submit
+  // after. Unlike hours-of-operation, there's no scheduling workaround here:
+  // pausing blocks ASAP and scheduled orders alike.
+  if (!restaurant.accepting_orders) {
+    return NextResponse.json({ error: `${restaurant.name} isn't taking orders right now.` }, { status: 400 });
+  }
 
   // Re-checked here even though the checkout page itself already blocks when
   // closed — a page loaded before closing time could still submit after.
+  // Only gates ASAP orders, though: a *scheduled* order is validated below
+  // against the scheduled time itself (isValidScheduledTime), not against
+  // right now — the whole point of scheduling ahead is placing an order
+  // while currently closed for a future slot the restaurant will be open for.
   const { data: hoursRows } = await supabase
     .from("restaurant_hours")
     .select("*")
     .eq("restaurant_id", restaurant.id)
     .returns<RestaurantHours[]>();
-  if (!isRestaurantOpen(hoursRows ?? [], restaurant.timezone)) {
+  if (!scheduledFor && !isRestaurantOpen(hoursRows ?? [], restaurant.timezone)) {
     return NextResponse.json({ error: `${restaurant.name} is currently closed.` }, { status: 400 });
   }
 
@@ -84,8 +95,14 @@ export async function POST(request: NextRequest) {
     }
     const check = isValidScheduledTime(hoursRows ?? [], restaurant.timezone, scheduledForDate);
     if (!check.ok) {
+      const message =
+        check.reason === "past"
+          ? "That time has already passed."
+          : check.reason === "too_far"
+            ? "You can only schedule an order up to 7 days ahead."
+            : `${restaurant.name} is closed at that time.`;
       return NextResponse.json(
-        { error: check.reason === "past" ? "That time has already passed." : `${restaurant.name} is closed at that time.` },
+        { error: message },
         { status: 400 }
       );
     }
@@ -165,7 +182,6 @@ export async function POST(request: NextRequest) {
 
   const discountedSubtotalCents = priced.subtotalCents - discountCents;
   const taxCents = Math.round((discountedSubtotalCents + priced.deliveryFeeCents) * Number(restaurant.tax_rate));
-  const totalCents = discountedSubtotalCents + priced.deliveryFeeCents + taxCents;
 
   const line_items = priced.lines.map((line) => ({
     quantity: line.quantity,
@@ -195,60 +211,66 @@ export async function POST(request: NextRequest) {
   // subtotalCents; handing Stripe a raw percent_off would have it re-derive
   // against the full line-item sum (including Delivery/Tax), which isn't
   // what was computed.
+  // Created in the connected account's own context — the coupon must live on
+  // the same account as the Checkout Session that references it, since this
+  // is now a direct charge (see stripeAccount below).
   let discounts: { coupon: string }[] | undefined;
   if (discountCents > 0) {
-    const coupon = await stripe.coupons.create({
-      amount_off: discountCents,
-      currency: restaurant.currency,
-      duration: "once",
-    });
+    const coupon = await stripe.coupons.create(
+      {
+        amount_off: discountCents,
+        currency: restaurant.currency,
+        duration: "once",
+      },
+      { stripeAccount: restaurant.stripe_account_id },
+    );
     discounts = [{ coupon: coupon.id }];
   }
 
-  // Pass-through only, not platform revenue — see src/lib/stripe.ts. Computed
-  // off the post-discount total (totalCents), per the zero-revenue
-  // pass-through model — the platform never profits from a promo discount.
-  const stripeFeePassThroughCents = Math.round(totalCents * STRIPE_FEE_PERCENT) + STRIPE_FEE_FIXED_CENTS;
   const origin = request.headers.get("origin") ?? new URL(request.url).origin;
 
   try {
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      // ui_mode: "elements" (Custom Checkout) — the client mounts just the
-      // Payment Element inline inside CheckoutForm.tsx's own layout via
-      // stripe.initCheckoutElementsSdk(), instead of "embedded_page"'s
-      // distinct Stripe-branded full-width takeover. Same client_secret
-      // contract either way. https://docs.stripe.com/payments/quickstart
-      ui_mode: "elements",
-      // Card only — Apple Pay/Google Pay surface automatically as wallets
-      // within the card payment method for eligible browsers/devices, no
-      // separate PMT entry needed. Klarna/Affirm/Link intentionally excluded.
-      payment_method_types: ["card"],
-      line_items,
-      discounts,
-      customer_email: customer.email,
-      return_url: `${origin}/r/${slug}/success?session_id={CHECKOUT_SESSION_ID}`,
-      integration_identifier: `ordernest-checkout-${randomLetters(8)}`,
-      payment_intent_data: {
-        application_fee_amount: stripeFeePassThroughCents,
-        transfer_data: { destination: restaurant.stripe_account_id },
+    // Created directly on the restaurant's connected account (stripeAccount)
+    // — a direct charge, not a destination charge. The restaurant is
+    // merchant of record and funds never touch the platform's balance; no
+    // application_fee_amount/transfer_data needed since OrderNest takes no
+    // cut. Stripe bills its own processing fee straight to the restaurant.
+    const session = await stripe.checkout.sessions.create(
+      {
+        mode: "payment",
+        // ui_mode: "elements" (Custom Checkout) — the client mounts just the
+        // Payment Element inline inside CheckoutForm.tsx's own layout via
+        // stripe.initCheckoutElementsSdk(), instead of "embedded_page"'s
+        // distinct Stripe-branded full-width takeover. Same client_secret
+        // contract either way. https://docs.stripe.com/payments/quickstart
+        ui_mode: "elements",
+        // Card only — Apple Pay/Google Pay surface automatically as wallets
+        // within the card payment method for eligible browsers/devices, no
+        // separate PMT entry needed. Klarna/Affirm/Link intentionally excluded.
+        payment_method_types: ["card"],
+        line_items,
+        discounts,
+        customer_email: customer.email,
+        return_url: `${origin}/r/${slug}/success?session_id={CHECKOUT_SESSION_ID}`,
+        integration_identifier: `ordernest-checkout-${randomLetters(8)}`,
+        metadata: {
+          restaurant_id: restaurant.id,
+          fulfillment_mode: fulfillmentMode,
+          customer_name: customer.name,
+          customer_phone: customer.phone,
+          pickup_time: timeLabel || "",
+          scheduled_for: scheduledForDate?.toISOString() ?? "",
+          delivery_address: fulfillmentMode === "delivery" ? JSON.stringify(delivery) : "",
+          location_id: resolvedLocation?.id ?? "",
+          promo_code: appliedPromoCode ?? "",
+          discount_cents: String(discountCents),
+          subtotal_cents: String(priced.subtotalCents),
+          delivery_fee_cents: String(priced.deliveryFeeCents),
+          tax_cents: String(taxCents),
+        },
       },
-      metadata: {
-        restaurant_id: restaurant.id,
-        fulfillment_mode: fulfillmentMode,
-        customer_name: customer.name,
-        customer_phone: customer.phone,
-        pickup_time: timeLabel || "",
-        scheduled_for: scheduledForDate?.toISOString() ?? "",
-        delivery_address: fulfillmentMode === "delivery" ? JSON.stringify(delivery) : "",
-        location_id: resolvedLocation?.id ?? "",
-        promo_code: appliedPromoCode ?? "",
-        discount_cents: String(discountCents),
-        subtotal_cents: String(priced.subtotalCents),
-        delivery_fee_cents: String(priced.deliveryFeeCents),
-        tax_cents: String(taxCents),
-      },
-    });
+      { stripeAccount: restaurant.stripe_account_id },
+    );
 
     return NextResponse.json({ clientSecret: session.client_secret });
   } catch (err) {

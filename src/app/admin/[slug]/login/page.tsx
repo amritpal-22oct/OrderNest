@@ -15,8 +15,12 @@ export default function AdminLoginPage({ params }: { params: Promise<{ slug: str
   const searchParams = useSearchParams();
   const urlError = searchParams.get("error");
 
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+  // TEMP dev convenience (requested this session, same pattern as
+  // CheckoutForm's prefilled test customer data): the seeded mithaas-cafe
+  // admin login, so manual admin runs don't need retyping every time.
+  // Revert to empty strings before this goes anywhere near real admins.
+  const [email, setEmail] = useState("admin@mithaascafe.test");
+  const [password, setPassword] = useState("TestAdmin123!");
   const [loading, setLoading] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 

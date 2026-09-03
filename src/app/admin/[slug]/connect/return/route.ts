@@ -29,10 +29,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       if (attempt > 0) await sleep(1500);
 
       const account = await stripe.v2.core.accounts.retrieve(restaurant.stripe_account_id, {
-        include: ["configuration.recipient"],
+        include: ["configuration.merchant"],
       });
       onboardingComplete =
-        account.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status === "active";
+        account.configuration?.merchant?.capabilities?.card_payments?.status === "active";
 
       if (onboardingComplete) break;
     }

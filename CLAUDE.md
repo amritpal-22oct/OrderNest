@@ -6,12 +6,11 @@
 
 A multi-tenant restaurant ordering platform (ChowNow/Toast-style): one codebase
 serves many restaurants, each with their own branded ordering page, menu, and
-order dashboard. In Stripe's own terminology this **is a Marketplace** (not a
-"SaaS platform" — see Stripe Connect section below): OrderNest runs checkout
-and is merchant of record, restaurants receive payouts as connected accounts,
-and OrderNest takes **no cut** — purely a payment facilitator, not a revenue
-share (see Checkout & webhook section for how `application_fee_amount` is
-still used, as a Stripe-fee pass-through, not platform revenue). No cross-restaurant
+order dashboard. OrderNest must never sit in the flow of funds: checkout uses
+**direct charges** (see Stripe Connect section below), so each restaurant —
+not OrderNest — is merchant of record and receives payment straight into its
+own connected account. OrderNest takes **no cut** — purely a payment
+facilitator, never touching the money itself. No cross-restaurant
 discovery/browsing though — each restaurant's ordering page is reached
 directly by its own slug, not surfaced in a marketplace-style directory.
 
@@ -27,8 +26,9 @@ client never touches card data or secret keys).
 
 - **Next.js 16** (App Router, TypeScript, Tailwind), `src/` layout, deployed to Vercel (planned)
 - **Supabase**: Postgres + Auth + Row Level Security — project `bccjapzfqkwkxiqxlelv` (see `.env.local`, gitignored)
-- **Stripe Connect** (Accounts v2, `recipient` configuration, `dashboard: "express"`) — each
-  restaurant onboards its own connected account via hosted onboarding; platform takes no cut
+- **Stripe Connect** (Accounts v2, `merchant` configuration, `dashboard: "express"`, direct
+  charges) — each restaurant onboards its own connected account via hosted onboarding and is
+  merchant of record on its own charges; platform takes no cut and never touches the funds
   (see "Stripe Connect" section below before touching this code)
 - MCP servers available in this session: `supabase` (schema/migrations/queries) and
   Stripe's official plugin MCP (`plugin:stripe:stripe`) — note its `stripe_api_search`/
@@ -58,24 +58,29 @@ dashboard.stripe.com/connect, which defaults new platforms onto v2 — v1 accoun
 creation fails outright with a "no longer recommends Accounts v1" error. This is a real
 gap between training data and current Stripe practice; don't assume v1 shapes are current.
 
-**OrderNest is a Marketplace, not a SaaS platform** (per Stripe's own platform taxonomy —
-see the `stripe-best-practices` skill's `references/connect.md`). That determines
-everything downstream:
-- Connected accounts get the **`recipient`** configuration (not `merchant`) — they receive
-  transfers, they don't process charges directly.
-- `defaults.responsibilities.fees_collector` / `losses_collector` = `"application"` (the
-  platform, not Stripe, owns fees and negative-balance risk).
-- `dashboard: "express"` (cobranded Express Dashboard, not the full Stripe Dashboard).
-- Checkout Sessions must use **destination charges** (`payment_intent_data.transfer_data.destination`
-  + `application_fee_amount`) — **not `on_behalf_of`**, which is for SaaS/direct-charge platforms
-  and is explicitly wrong for a standard marketplace flow. **Built** — see `src/app/api/checkout/route.ts`.
-  `application_fee_amount` here is a **Stripe-fee pass-through, not platform revenue** — OrderNest
-  takes no cut (explicit product decision); see the Checkout & webhook section for why
-  `application_fee_amount` still has to be set to something even at 0% platform take.
+**OrderNest must never be in the flow of funds** — the explicit product requirement that
+drives this whole section (confirmed against Stripe's own Connect guidance via the
+`connect-recommend` skill's charge-pattern/compatibility references and the installed SDK's
+v2 type defs, not assumed). That means **direct charges**, not destination charges:
+- Connected accounts get the **`merchant`** configuration (not `recipient`) with `card_payments`
+  requested — `recipient` accounts can only *receive transfers*, they can't process a charge
+  directly, which direct charges require. See `Accounts.d.ts`'s `Configuration.Merchant`
+  interface for the exact shape.
+- `dashboard: "express"` stays, with `defaults.responsibilities.fees_collector` /
+  `losses_collector` = `"application"` — the one Express-dashboard combination Stripe allows
+  for every charge type including direct.
+- Checkout Sessions are created **directly on the connected account** via the `stripeAccount`
+  request option (`stripe.checkout.sessions.create(params, { stripeAccount: acctId })`), not
+  on the platform account. The restaurant is merchant of record; the charge — and Stripe's own
+  processing fee — lands on and is deducted from *their* balance, never the platform's. No
+  `application_fee_amount`/`transfer_data` needed, since OrderNest takes no cut. **Built** — see
+  `src/app/api/checkout/route.ts`. Every other call that touches a restaurant's charge (session
+  retrieve on the success page and in the webhook, refunds) needs the same `{ stripeAccount }`
+  option — grep for `stripeAccount` if adding a new one.
 
 **Capability check uses the v2 path, not deprecated v1 fields:**
-`account.configuration.recipient.capabilities.stripe_balance.stripe_transfers.status === "active"`
-— never `charges_enabled`/`payouts_enabled`. Requires `include: ["configuration.recipient"]` on
+`account.configuration.merchant.capabilities.card_payments.status === "active"`
+— never `charges_enabled`/`payouts_enabled`. Requires `include: ["configuration.merchant"]` on
 retrieve, since v2 nested config isn't returned by default. This lives in
 `src/app/admin/[slug]/connect/return/route.ts`.
 
@@ -94,14 +99,15 @@ snapshot events. Don't assume the same webhook pattern applies — verified this
 `search_stripe_documentation` before writing any code, since guessing here would've meant a third
 Connect-related rewrite.
 
-- Event type: `v2.core.account[configuration.recipient].capability_status_updated` (fires
-  specifically when a recipient capability like `stripe_transfers` changes status — more precise
-  than the broader `[requirements].updated`).
+- Event type: `v2.core.account[configuration.merchant].capability_status_updated` (fires
+  specifically when a merchant capability like `card_payments` changes status — more precise
+  than the broader `[requirements].updated`; confirmed exact string in the installed SDK's
+  `resources/V2/Core/Events.d.ts`).
 - Verified with `stripe.parseEventNotificationAsync(rawBody, signature, secret)`, **not**
   `stripe.webhooks.constructEvent()` — a distinct method for thin events.
 - The notification payload is tiny (`related_object.id` = the account id, plus the event type) —
   full account details (needed for the capability status) are fetched separately via
-  `stripe.v2.core.accounts.retrieve(accountId, { include: ["configuration.recipient"] })`, same
+  `stripe.v2.core.accounts.retrieve(accountId, { include: ["configuration.merchant"] })`, same
   call as the return route uses.
 - **Separate signing secret** from the v1 checkout webhook: `STRIPE_CONNECT_WEBHOOK_SECRET` in
   `.env.local`, distinct from `STRIPE_WEBHOOK_SECRET`. In production these come from two separate
@@ -118,17 +124,32 @@ Connect-related rewrite.
 **Test-mode onboarding is fast**: the hosted onboarding flow has one-click shortcuts —
 "Use test phone number" / "Use test code" for phone verification, and "Use test account" on
 the bank details step (auto-fills Stripe Test Bank). Individual/sole-proprietor + those
-shortcuts + a plausible name/DOB/address is enough to get `stripe_transfers` to `active` in a
-sandbox. Mithaas Cafe's connected account was onboarded exactly this way — see seeded dev data
-below.
+shortcuts + a plausible name/DOB/address is enough to get a capability to `active` in a
+sandbox. Mithaas Cafe's connected account was originally onboarded this way for `recipient`/
+`stripe_transfers` — see seeded dev data below for what happened when it later requested
+`merchant`/`card_payments` too (activated instantly from existing identity info, no full
+re-onboarding actually required in this case).
 
-**Watch for the "Personal details: Incomplete" trap in review**: after filling the personal
-details form's real fields, the review page can still show a section as `Incomplete` with an
-unhelpful generic "Please complete all sections above" error on submit. Re-opening that
-section's Edit and just re-touching the (already-filled) field — even something as trivial as
-re-typing the phone number — clears it. Seemed to be a UI state sync issue with the hosted flow,
-not a real missing field. If "Agree and submit" won't go through, check each section's badge
-individually rather than trusting the top-level warning to point at the right one.
+**Watch for the "Personal details: Incomplete" trap in review (`recipient`/`stripe_transfers`
+era)**: after filling the personal details form's real fields, the review page can still show a
+section as `Incomplete` with an unhelpful generic "Please complete all sections above" error on
+submit. Re-opening that section's Edit and just re-touching the (already-filled) field — even
+something as trivial as re-typing the phone number — clears it. Seemed to be a UI state sync
+issue with the hosted flow, not a real missing field. If "Agree and submit" won't go through,
+check each section's badge individually rather than trusting the top-level warning to point at
+the right one.
+
+**A different, heavier "Personal details: Incomplete" gate exists for `merchant`/`card_payments`
+— the phone re-touch trick above does NOT clear it.** Requesting `card_payments` on an account
+triggers real government-ID document verification ("Verify your identity" / "Liveness
+verification" / "Verify your ID and home address") — a materially higher KYC bar than
+`recipient`'s `stripe_transfers`. Confirmed by testing: re-touching fields left the section
+`Incomplete`; only completing (or explicitly skipping, via "Skip for now") the ID-verification
+step moved past it. Don't assume this is the same UI glitch as the recipient-era trap — it isn't,
+and no fake documents should ever be uploaded to clear it. Note this gate blocks the hosted
+*onboarding UI*'s "Review and confirm" completion, not necessarily the capability itself — Mithaas
+Cafe's `card_payments` reached `status: "active"` without ever completing this step, since Stripe
+evaluates capability activation from whatever identity info the account already has on file.
 
 ## Checkout & webhook (read before touching `src/app/api/checkout` or `src/app/api/webhooks/stripe`)
 
@@ -150,18 +171,17 @@ exist. Applies to any future embedded-Checkout mount point, not just this one.
 the client-submitted cart is just `{item_id: quantity}`; prices, delivery fee, and tax are looked
 up/derived from the restaurant's own DB row and settings, never trusted from the request body.
 
-**No platform fee — explicit product decision** (confirmed directly, not assumed): OrderNest
-"should not [be] involve[d] in any fee... it should purely be between restaurant and stripe...
-we are just facilitating payments." A destination charge still lands on the *platform's* Stripe
-balance before transferring to the restaurant, so Stripe's own processing fee would otherwise be
-deducted from the platform, not the restaurant, by default. `application_fee_amount` is still set
-on every session — not as a cut, but as a **pass-through** equal to Stripe's own estimated fee
-(`STRIPE_FEE_PERCENT` + `STRIPE_FEE_FIXED_CENTS` in `src/lib/stripe.ts`, currently the standard
-Stripe Canada domestic-card rate, 2.9% + $0.30 — an approximation, not exact for every card
-type/currency). Net effect: platform nets ~$0 per transaction, restaurant's payout absorbs
-Stripe's fee, same as if they'd connected to Stripe directly themselves. If a real platform
-revenue model is ever wanted, this is the constant to repurpose — but don't reintroduce it without
-being asked; the zero-fee decision was deliberate, not a placeholder.
+**No platform fee, and no flow of funds — explicit product decisions** (confirmed directly, not
+assumed): OrderNest "should not [be] involve[d] in any fee... it should purely be between
+restaurant and stripe... we are just facilitating payments," and should never sit in the flow of
+funds at all. Direct charges (see Stripe Connect section above) satisfy both at once: the charge
+is created on the restaurant's own connected account via `{ stripeAccount }`, so the money never
+touches the platform's balance, and Stripe deducts its own processing fee straight from the
+restaurant's balance automatically — no `application_fee_amount`/`transfer_data`, and no need for
+the fee-approximation math a destination charge would have required. If a real platform revenue
+model is ever wanted, `application_fee_amount` on the direct charge is the mechanism to reach for
+— but don't reintroduce it without being asked; the zero-fee decision was deliberate, not a
+placeholder.
 
 **Webhook idempotency**: `orders.stripe_checkout_session_id` has a unique index (partial, only
 where not null); `fulfillOrder()` in the webhook checks for an existing row with that session id
@@ -180,7 +200,7 @@ the v2 thin Connect webhook:
 stripe listen --api-key <STRIPE_SECRET_KEY> \
   --events checkout.session.completed,checkout.session.async_payment_succeeded \
   --forward-to localhost:3000/api/webhooks/stripe \
-  --thin-events "v2.core.account[configuration.recipient].capability_status_updated" \
+  --thin-events "v2.core.account[configuration.merchant].capability_status_updated" \
   --forward-thin-to localhost:3000/api/webhooks/stripe-connect
 ```
 Installed via `brew install stripe/stripe-cli/stripe` this session. `stripe listen` prints one
@@ -189,6 +209,17 @@ put the same value in `.env.local` as both `STRIPE_WEBHOOK_SECRET` and
 `STRIPE_CONNECT_WEBHOOK_SECRET`, then restart `next dev` (env vars aren't hot-reloaded). The
 secret is regenerated every time `stripe listen` restarts, so both vars need updating again if the
 listener is ever stopped/restarted — they'll drift out of sync if you only update one.
+
+**Direct charges mean `checkout.session.completed` (and `refund.updated`) now fire on the
+connected account, not the platform** — confirmed via a real end-to-end test order + refund
+against `mithaas-cafe`'s connected account: `stripe listen`'s `--forward-to` delivers these with
+**no extra flag needed** — the CLI logs them prefixed `connect` (e.g. `connect
+checkout.session.completed`) and forwards them to the same `--forward-to` endpoint as platform
+events. (A real Stripe Dashboard-registered webhook endpoint in production still needs "Listen to
+events on Connected accounts" explicitly enabled — only the local CLI behavior is confirmed
+automatic.) Any handler reading `event.data.object` for a Connect-forwarded event also needs
+`event.account` if it re-fetches the object from Stripe (see `fulfillOrder` in
+`src/app/api/webhooks/stripe/route.ts`, which passes it through as `{ stripeAccount }`).
 
 ## Multi-location delivery
 
@@ -286,6 +317,55 @@ overnight-wrap edges: still-open late stretch, carried-over early morning, and p
 wiring it into the two checkout gates. Not covered by an actual test file yet — the verification was
 a one-off script, not a committed test (see "Not built yet": no automated tests exist in this repo).
 
+## Scheduled ordering
+
+`src/lib/scheduling.ts` (`getSchedulingAvailability`, `isValidScheduledTime`, both used client- and
+server-side) has two modes: **`"unrestricted"`** when a restaurant has zero `restaurant_hours` rows
+(same "no rows = always open" default as above — nothing to enumerate against), and **`"slots"`**
+once hours are configured, which pre-computes real open time slots per day (30-minute increments,
+`SLOT_MINUTES`) rather than just a yes/no per day.
+
+**Capped to the next 7 days** (`DAYS_AHEAD`, exported from `scheduling.ts` so the client doesn't
+hand-copy the number) — enforced on both ends: the client's date `<input>` gets `min`/`max`
+attributes, and `isValidScheduledTime` independently rejects anything past `now + DAYS_AHEAD` with a
+dedicated `"too_far"` reason (surfaced as its own error message in `/api/checkout`), not just a
+client-side convenience.
+
+**No raw `datetime-local`/`<select>` — matches the rest of the form's pill-button style.**
+`CheckoutForm.tsx`'s "When" section used to render a bare `<input type="datetime-local">` for
+unrestricted restaurants (browsers render this with an unstyled, truncated placeholder —
+`yyyy-mm-dd, --:-- --` — that reads as broken) and two plain `<select>` dropdowns for slots-mode
+restaurants. Replaced with: separate labeled `Date`/`Time` inputs for unrestricted mode, and a
+horizontal row of day pills + a wrapped row of time-slot pills for slots mode — same rounded-pill
+look as the existing Delivery/Pickup and ASAP/Schedule toggles, not a new pattern.
+
+**Closed right now no longer blocks ordering ahead.** This was a real bug, not just polish: both the
+checkout page and `/api/checkout` used to hard-block with "currently closed" whenever
+`isRestaurantOpen()` was false *at request time* — even for a **scheduled** future order that would
+land squarely inside store hours, which defeats the entire point of scheduling ahead. Fixed on both
+ends:
+- `/api/checkout`'s `isRestaurantOpen` gate now only applies when `!scheduledFor` (ASAP orders); a
+  scheduled order is validated against *its own* scheduled time via `isValidScheduledTime` instead,
+  which already checks the target time falls inside hours.
+- `checkout/page.tsx` only shows the hard-block screen when there's truly no way to order at all:
+  closed now **and** (slots-mode with zero upcoming open days in the 7-day window). Unrestricted-mode
+  restaurants can never hit this, since `isRestaurantOpen` with no hours rows is always `true`.
+- `CheckoutForm.tsx` computes `openNow` client-side (same `isRestaurantOpen`, safe to call from a
+  Client Component — no server-only dependencies) and defaults `scheduleMode` to `"schedule"` with
+  the "As soon as possible" toggle disabled when closed, plus an inline note explaining why — rather
+  than silently defaulting to a mode the customer can't actually use.
+
+**Fixed a real "stuck on Loading payment" bug while touching this form**, unrelated to hours but
+found and reported during testing here: `CheckoutForm.tsx`'s `<Script src=".../stripe.js">` used
+`onLoad={() => setStripeLoaded(true)}`. Next.js's `next/script` (`node_modules/next/dist/client/script.js`)
+only invokes `onLoad` on a script's *first* load globally (`loadScript()` bails out early if the
+script is already in its module-level `LoadCache`); if `CheckoutForm` unmounts and remounts — e.g.
+the customer hits the browser back button, then forward again — `onLoad` never fires a second time,
+and `stripeLoaded` (freshly `false` on the new mount) stays `false` forever, permanently disabling
+the payment button. Next.js has a dedicated `onReady` prop built exactly for this remount case (see
+the state-machine comment in `script.js` itself); switched to it. If this component ever needs
+another third-party `<Script>` with client state gated on load, use `onReady`, not `onLoad`.
+
 ## Planned routes
 
 - `/r/[slug]` — **built**: public landing page per restaurant (`src/app/r/[slug]/page.tsx`, server
@@ -307,12 +387,18 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
   here instead of `/r/[slug]` (checkout's two blocking screens, success page, CheckoutForm's
   empty-cart screen) — grep for `` `/r/${slug}` `` (or `restaurant.slug`) if you add a new one and
   aren't sure which of the two it should point to: the landing page for "start over", `/order` for
-  "back to ordering".
+  "back to ordering". Layout benchmarked live against sardarji.ca (a real multi-location Indian
+  restaurant site with a polished ordering UI): the category sidebar is `sticky`, menu item cards get
+  a hover lift/shadow, and — the bigger change — the cart is a **persistent right-hand column at
+  `lg:` and up** (`aside.sticky`, always visible, no click-to-open) rather than a click-to-open
+  drawer; the drawer still exists but only as the `lg:hidden` mobile fallback, sharing the same
+  item-list/totals JSX so the two can't drift out of sync. Active promo codes render as a bigger
+  icon-badge banner (`bg-green-50` card, not a thin one-line strip) for the same reason.
 - `/r/[slug]/checkout` — **built**: contact/delivery form (`CheckoutForm.tsx`) → `POST
-  /api/checkout` prices the cart server-side and creates a destination-charge embedded
-  Checkout Session → mounts inline via Stripe.js. Falls back to a "coming soon" notice if
-  the restaurant hasn't completed Stripe Connect onboarding yet. See Checkout & webhook
-  section above.
+  /api/checkout` prices the cart server-side and creates a direct-charge embedded
+  Checkout Session on the restaurant's connected account → mounts inline via Stripe.js.
+  Falls back to a "coming soon" notice if the restaurant hasn't completed Stripe Connect
+  onboarding yet. See Checkout & webhook section above.
 - `/r/[slug]/success` — **built**: verifies the session server-side against Stripe (never
   trusts the browser/URL), shows the confirmed order, clears the local cart.
 - `/api/checkout`, `/api/webhooks/stripe`, and `/api/webhooks/stripe-connect` — **built**, see
@@ -330,6 +416,11 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
   hours-of-operation, so the extra precision wasn't worth the complexity. Verified end-to-end via
   browser against real `mithaas-cafe` orders (each filter individually and combined) and against a
   throwaway 25-order seed for pagination (page 1 of 2 → page 2, correct "Showing X–Y of Z" counts).
+  The submit button reads "Search" (not "Filter") and the `From`/`To` date inputs have their own
+  labels stacked above them — a first attempt put the label inline (`flex items-center gap-2`) next
+  to the input, which overlapped the *next* field's label because a flex child's default
+  `min-width: auto` doesn't let `w-full` shrink it below the native date input's own content width;
+  labels stacked above the input side-step that instead of fighting it with `min-w-0`.
 - `/admin/[slug]/connect/return` and `/admin/[slug]/connect/refresh` — Stripe's hosted-onboarding
   redirect targets (**built**, see Stripe Connect section above)
 - `/onboard` — **built, platform-admin-gated** (not public self-serve — see "Not built yet" for why):
@@ -357,7 +448,16 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
   toggle availability — all authorized via existing RLS policies (session-scoped client, no
   service-role bypass needed). New categories default to a low/null `sort_order` so they render
   **first**, not last — not a bug, just worth knowing before assuming an add failed silently.
-  Verified end-to-end via browser + DB checks.
+  Verified end-to-end via browser + DB checks. Menu items can have a photo (`ImageUploadField.tsx`,
+  `menu_items.image_url`) — read by `RestaurantMenu.tsx` and falls back to the item's `emoji` when
+  unset, so existing items with no photo are unaffected. There's still no equivalent upload for the
+  *restaurant's* own logo (`restaurants.logo_url`) — see "Not built yet".
+- `/admin/[slug]/promo` — **built**: promo/coupon code management (percent or fixed-amount discount,
+  optional minimum subtotal, active/inactive toggle). `src/lib/promo.ts`'s `validatePromoCode` backs
+  both `POST /api/promo/validate` (called live from `CheckoutForm.tsx` as the customer types a code,
+  for an instant preview) and the authoritative re-check inside `/api/checkout` itself before the
+  Stripe session is created — same "client preview, server re-validates" pattern as pricing and the
+  delivery-radius/hours checks elsewhere in checkout.
 - `/platform-admin` and `/platform-admin/login` — **built**: cross-restaurant super-admin view.
   `requirePlatformAdmin()` (`src/lib/platform-admin.ts`) gates the page; RLS's
   `is_platform_admin()` (used inside `is_restaurant_admin()`) is what actually grants the
@@ -390,15 +490,27 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
   one test admin user — `admin@mithaascafe.test` / `TestAdmin123!` (local Supabase dev
   project only, not a real secret) — full menu (4 categories, 17 items, ported from the
   static site's `MENU_DATA`). Has a real (test-mode) Stripe Connect account,
-  `acct_1UBRDfC5FfrDmREo`, onboarded via the hosted flow with `stripe_transfers` active, and at
-  least one real paid order from an end-to-end test checkout (on top of the two hand-seeded
-  sample orders used to exercise the dashboard before checkout existed).
+  `acct_1UBRDfC5FfrDmREo`, with both `recipient`/`stripe_transfers` (destination-charge era) and
+  `merchant`/`card_payments` (current, direct-charge) applied and active — the account already
+  had enough identity info on file from the original onboarding that requesting `merchant`
+  activated `card_payments` instantly, no new hosted-onboarding fields needed (confirmed via the
+  Stripe API directly: `card_payments.status === "active"` right after the capability request).
+  Has at least one real paid-and-refunded order from an end-to-end direct-charge test (on top of
+  the two hand-seeded sample orders used to exercise the dashboard before checkout existed) —
+  verified the charge exists *only* on the connected account (a platform-account lookup of the
+  same `payment_intent` id 404s) and that OrderNest's balance was never touched.
 
 ## Not built yet (in rough priority order)
 
+> Kept in sync with actual code state, not just intent — before trusting an item here as still
+> missing, it's worth a quick grep, since this list has drifted from reality before (promo codes,
+> menu item images, the sticky sidebar, and scheduled ordering were all built in earlier sessions
+> but stayed listed here as "not built" for a while afterward).
+
 1. **Deployment** — still local-only (`npm run dev`); Vercel deploy, production env vars, and
    real Stripe Event Destinations (v1 + v2 thin) pointed at the deployed URL instead of
-   `stripe listen` are all outstanding.
+   `stripe listen` are all outstanding. Nothing about the app itself blocks this — it's purely
+   unstarted infra work.
 2. **Restaurant settings UI** — `tax_rate`, `delivery_fee_cents`, `free_delivery_threshold_cents`,
    currency, etc. exist as DB columns (read by checkout/menu pages) but have no admin UI; only
    editable by hand via SQL/seed today. (`delivery_radius_km` and `timezone` are the exceptions —
@@ -406,28 +518,24 @@ a one-off script, not a committed test (see "Not built yet": no automated tests 
 3. **Auth completeness** — no password reset flow, no way to invite a second admin to an existing
    restaurant (`restaurant_admins` supports multiple rows, but only onboarding's initial owner
    insert exists). `/onboard` itself is no longer public (platform-admin-gated), but
-   `/api/geocode` and `/api/geocode/suggest` still are, with no rate limiting — see "Multi-location
-   delivery" above.
-4. **Order lifecycle beyond "paid"** — no refund/cancellation handling, no customer-facing order
-   status notifications (email/SMS) when status changes.
-5. **Branding/customization per tenant** — no logo/image upload for restaurants or menu items
-   (emoji only today), no custom domain support.
-6. Automated tests — none yet (all verification so far has been manual/live browser + DB checks, plus
-   one one-off `npx tsx` script for `isRestaurantOpen()`'s edge cases — not a committed test file).
-7. **Ordering-flow gaps found by benchmarking against sardarji.ca** (a real multi-location Indian
-   restaurant site, researched live this session — see the git log around the landing-page commit for
-   the full comparison). Implemented from that research: the `/r/[slug]` landing page, hours/location
-   shown on the order page, menu search, and the direct-location-select list. Still open, roughly in
-   the order a customer would notice them:
-   - No real scheduled ordering — pickup time is a fixed 4-option dropdown (`CheckoutForm.tsx`), no
-     date picker, and delivery has no timing selection at all. No prep-time estimate either.
-   - No per-item special instructions — only one restaurant-wide delivery-instructions field exists;
-     nothing for pickup orders, nothing per line item.
-   - No promo/coupon code system.
-   - Menu is flat scrolling sections; no sticky category sidebar nav (sardarji.ca has one with
-     per-category item counts) — search (built) covers some of the same need but doesn't replace it
-     for a large menu.
-   - `menu_items.image_url` exists in the schema but is never read by any page, and there's no admin
-     upload for it (or for `restaurants.logo_url`) — menu items only ever show `emoji`. This is also
-     why the landing hero is brand-color/typography rather than photography.
+   `/api/geocode` and `/api/geocode/suggest` are still public with **no rate limiting** — lower
+   stakes than the pre-fix `/onboard` gap (Mapbox quota cost, not account creation) but worse for
+   `/suggest` specifically since it fires per keystroke, not once per checkout.
+4. **Order lifecycle beyond "paid"** — an admin can set an order's status to `cancelled`, but that's
+   just a label on the row; there's no actual Stripe refund/void wired to it, and no customer-facing
+   notification (email/SMS) of any status change.
+5. **Restaurant-level branding** — menu items *do* support a photo now (`ImageUploadField.tsx`,
+   read by `RestaurantMenu.tsx`), but there's still no equivalent for the restaurant's own identity:
+   no logo upload (`restaurants.logo_url` unused), no custom domain support. This is also why the
+   `/r/[slug]` landing hero is brand-color/typography rather than a photo.
+6. **No automated tests** — all verification so far has been manual/live browser + DB checks, plus
+   one one-off `npx tsx` script for `isRestaurantOpen()`'s edge cases (not a committed test file).
+7. **Smaller ordering-flow gaps**, remaining from an earlier live benchmark against sardarji.ca (a
+   real multi-location Indian restaurant site — see the git log around the landing-page commit, and
+   the "Scheduled ordering" section above for what that benchmark led to on the scheduling side
+   specifically):
+   - No per-item special instructions — only one restaurant-wide delivery-instructions field exists
+     (`CheckoutForm.tsx`); nothing for pickup orders, nothing per line item.
+   - No prep-time estimate shown alongside the scheduling picker (scheduled ordering itself — date
+     picker, store-hours enforcement, the 7-day cap — is built; see "Scheduled ordering" above).
 

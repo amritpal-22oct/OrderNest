@@ -27,9 +27,24 @@ create table restaurants (
   free_delivery_threshold_cents integer,
   stripe_account_id text,
   stripe_onboarding_complete boolean not null default false,
+  -- Platform-billing Customer (cus_...) on OrderNest's own Stripe account —
+  -- unrelated to stripe_account_id above (the restaurant's connected Account
+  -- for their own order payments). Subscriptions are created/managed by hand
+  -- in the Stripe Dashboard (no in-app Checkout/webhook integration by
+  -- design); this id is pasted in once so the platform-admin dashboard can
+  -- look up live subscription status instead of tracking it manually.
+  stripe_customer_id text,
   is_live boolean not null default false,
   delivery_radius_km numeric,
   timezone text not null default 'America/Toronto',
+  -- Manual pause switch, independent of hours-of-operation: hours describe a
+  -- recurring weekly schedule and still allow scheduling ahead for a later
+  -- open slot even while currently closed; this is a blunter "not taking any
+  -- orders right now" toggle (ASAP or scheduled) for things hours can't
+  -- express — short-staffed, temporarily overwhelmed, closed for the day
+  -- outside the normal schedule. Defaults true so every existing tenant is
+  -- unaffected until an admin explicitly pauses.
+  accepting_orders boolean not null default true,
   created_at timestamptz not null default now()
 );
 
@@ -126,6 +141,22 @@ create table orders (
     check (status in ('pending', 'paid', 'preparing', 'ready', 'completed', 'cancelled')),
   stripe_checkout_session_id text,
   stripe_payment_intent_id text,
+  -- Set together when cancelAndRefundOrderAction (src/app/admin/[slug]/actions.ts)
+  -- issues a refund. stripe_refund_id is the audit trail back to the actual
+  -- Stripe Refund object, and the join key the stripe webhook uses to find
+  -- this row again when the refund's status changes asynchronously.
+  -- refunded_at is when the refund was *requested*, not necessarily when it
+  -- finished — Stripe refunds aren't always instant (see refund_status).
+  stripe_refund_id text,
+  refunded_at timestamptz,
+  -- Stripe's own Refund.status ('pending' | 'requires_action' | 'succeeded' |
+  -- 'failed' | 'canceled'), not assumed from "the create call didn't throw" —
+  -- a refund can come back pending and later fail asynchronously (Stripe's
+  -- refund.updated / refund.failed webhook events, handled in
+  -- src/app/api/webhooks/stripe/route.ts, keep this in sync). This is the
+  -- actual source of truth for "did the money move," independent of `status`
+  -- above, which stays 'cancelled' regardless of how the refund resolves.
+  refund_status text,
   created_at timestamptz not null default now()
 );
 
@@ -273,3 +304,32 @@ with check (bucket_id = 'menu-item-images' and is_restaurant_admin((storage.fold
 create policy "restaurant admins delete their own menu item images"
 on storage.objects for delete to authenticated
 using (bucket_id = 'menu-item-images' and is_restaurant_admin((storage.foldername(name))[1]::uuid));
+
+-- ---------- Storage: restaurant logos ----------
+-- Same shape as menu-item-images (path {restaurant_id}/{uuid}.{ext}, public
+-- read, is_restaurant_admin-gated write). In practice the only writer today
+-- is /api/onboard uploading the new restaurant's logo via the service-role
+-- client (bypasses RLS — the uploading platform admin isn't yet a
+-- restaurant_admin of the restaurant being created, so these policies
+-- couldn't authorize that upload even if they tried); the restaurant-admin
+-- policies below exist for a future self-service "edit my logo" page.
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('restaurant-logos', 'restaurant-logos', true, 5242880, array['image/jpeg','image/png','image/webp'])
+on conflict (id) do nothing;
+
+create policy "restaurant logos are publicly readable"
+on storage.objects for select using (bucket_id = 'restaurant-logos');
+
+create policy "restaurant admins upload their own logo"
+on storage.objects for insert to authenticated
+with check (bucket_id = 'restaurant-logos' and is_restaurant_admin((storage.foldername(name))[1]::uuid));
+
+create policy "restaurant admins update their own logo"
+on storage.objects for update to authenticated
+using (bucket_id = 'restaurant-logos' and is_restaurant_admin((storage.foldername(name))[1]::uuid))
+with check (bucket_id = 'restaurant-logos' and is_restaurant_admin((storage.foldername(name))[1]::uuid));
+
+create policy "restaurant admins delete their own logo"
+on storage.objects for delete to authenticated
+using (bucket_id = 'restaurant-logos' and is_restaurant_admin((storage.foldername(name))[1]::uuid));

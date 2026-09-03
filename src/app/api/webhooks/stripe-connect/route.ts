@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
   }
 
-  if (notification.type === "v2.core.account[configuration.recipient].capability_status_updated") {
+  if (notification.type === "v2.core.account[configuration.merchant].capability_status_updated") {
     const accountId = notification.related_object?.id;
     if (accountId) await syncOnboardingStatus(accountId);
   }
@@ -36,10 +36,10 @@ export async function POST(request: NextRequest) {
 
 async function syncOnboardingStatus(accountId: string) {
   const account = await stripe.v2.core.accounts.retrieve(accountId, {
-    include: ["configuration.recipient"],
+    include: ["configuration.merchant"],
   });
   const onboardingComplete =
-    account.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status === "active";
+    account.configuration?.merchant?.capabilities?.card_payments?.status === "active";
 
   const supabase = createAdminClient();
   const { error } = await supabase

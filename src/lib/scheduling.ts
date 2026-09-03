@@ -2,7 +2,10 @@ import type { RestaurantHours } from "./types";
 import { isRestaurantOpen } from "./hours";
 
 const SLOT_MINUTES = 30;
-const DAYS_AHEAD = 7;
+// Also the cap for "unrestricted" mode's date picker (no hours configured) —
+// exported so the client can mirror it in the date input's max attribute
+// rather than hand-copying the number.
+export const DAYS_AHEAD = 7;
 
 export type SlotOption = { value: string; label: string }; // value = ISO UTC instant
 
@@ -142,8 +145,13 @@ export function isValidScheduledTime(
   timezone: string,
   scheduledFor: Date,
   now: Date = new Date()
-): { ok: true } | { ok: false; reason: "past" | "closed" } {
+): { ok: true } | { ok: false; reason: "past" | "too_far" | "closed" } {
   if (scheduledFor.getTime() < now.getTime()) return { ok: false, reason: "past" };
+  // Same window "slots" mode already enumerates (DAYS_AHEAD) — the
+  // "unrestricted" (no hours configured) case had no upper bound at all
+  // before this, letting the client's datetime-local input accept any
+  // future date.
+  if (scheduledFor.getTime() > now.getTime() + DAYS_AHEAD * 24 * 60 * 60 * 1000) return { ok: false, reason: "too_far" };
   if (hours.length > 0 && !isRestaurantOpen(hours, timezone, scheduledFor)) return { ok: false, reason: "closed" };
   return { ok: true };
 }

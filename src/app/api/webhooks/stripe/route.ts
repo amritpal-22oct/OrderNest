@@ -24,14 +24,36 @@ export async function POST(request: NextRequest) {
   if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
     const sessionSummary = event.data.object as Stripe.Checkout.Session;
     if (sessionSummary.payment_status === "paid") {
-      await fulfillOrder(sessionSummary.id);
+      // Direct charge — this event fires for a session that lives on the
+      // restaurant's connected account, so event.account carries which one;
+      // fulfillOrder needs it to retrieve the session in the right context.
+      await fulfillOrder(sessionSummary.id, event.account ?? null);
     }
+  }
+
+  // Keeps orders.refund_status honest after cancelAndRefundOrderAction
+  // (src/app/admin/[slug]/actions.ts) initiates a refund — that action can
+  // only record the *initial* status Stripe returns synchronously (often
+  // "pending", not final), and a pending refund can still resolve to
+  // "succeeded" or fail later. These are the unified events for all refund
+  // types as of Stripe's 2024-10-28 API version (refund.created also exists
+  // but isn't needed here — we already have the refund id from the create
+  // call's own response).
+  if (event.type === "refund.updated" || event.type === "refund.failed") {
+    const refund = event.data.object as Stripe.Refund;
+    await syncRefundStatus(refund.id, refund.status);
   }
 
   return NextResponse.json({ received: true });
 }
 
-async function fulfillOrder(sessionId: string) {
+async function syncRefundStatus(refundId: string, status: string | null) {
+  const supabase = createAdminClient();
+  const { error } = await supabase.from("orders").update({ refund_status: status }).eq("stripe_refund_id", refundId);
+  if (error) console.error("Webhook: failed to sync refund_status", refundId, error);
+}
+
+async function fulfillOrder(sessionId: string, accountId: string | null) {
   const supabase = createAdminClient();
 
   const { data: existing } = await supabase
@@ -41,9 +63,11 @@ async function fulfillOrder(sessionId: string) {
     .maybeSingle();
   if (existing) return; // already processed — Stripe retried, or both event types fired
 
-  const session = await stripe.checkout.sessions.retrieve(sessionId, {
-    expand: ["line_items", "payment_intent"],
-  });
+  const session = await stripe.checkout.sessions.retrieve(
+    sessionId,
+    { expand: ["line_items", "payment_intent"] },
+    accountId ? { stripeAccount: accountId } : undefined,
+  );
 
   const meta = session.metadata ?? {};
   const restaurantId = meta.restaurant_id;

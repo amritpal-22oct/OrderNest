@@ -36,6 +36,14 @@ export default async function RestaurantLandingPage({ params }: { params: Promis
         className="flex min-h-[70vh] flex-col items-center justify-center px-6 py-24 text-center text-white"
         style={{ background: `linear-gradient(135deg, ${restaurant.brand_color}, #1a1a1a)` }}
       >
+        {restaurant.logo_url && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={restaurant.logo_url}
+            alt=""
+            className="mb-6 h-24 w-24 rounded-full border-4 border-white/20 bg-white object-cover shadow-lg"
+          />
+        )}
         <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">{restaurant.name}</h1>
         {restaurant.description && (
           <p className="mt-4 max-w-xl text-lg text-white/80">{restaurant.description}</p>

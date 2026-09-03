@@ -32,7 +32,11 @@ export default async function SuccessPage({
   const { session_id: sessionId } = await searchParams;
 
   const supabase = await createClient();
-  const { data: restaurant } = await supabase.from("restaurants").select("name, currency").eq("slug", slug).maybeSingle();
+  const { data: restaurant } = await supabase
+    .from("restaurants")
+    .select("name, currency, stripe_account_id")
+    .eq("slug", slug)
+    .maybeSingle();
   if (!restaurant) notFound();
 
   if (!sessionId) {
@@ -41,7 +45,14 @@ export default async function SuccessPage({
 
   let session;
   try {
-    session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["line_items"] });
+    // Direct charge — the session lives on the restaurant's connected
+    // account, not the platform, so it can only be retrieved with the
+    // matching stripeAccount context.
+    session = await stripe.checkout.sessions.retrieve(
+      sessionId,
+      { expand: ["line_items"] },
+      { stripeAccount: restaurant.stripe_account_id ?? undefined },
+    );
   } catch {
     return <NoOrder slug={slug} restaurantName={restaurant.name} />;
   }

@@ -4,6 +4,9 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
+const MAX_LOGO_BYTES = 5 * 1024 * 1024;
+const ALLOWED_LOGO_TYPES = ["image/jpeg", "image/png", "image/webp"];
+
 function slugify(input: string) {
   return input
     .toLowerCase()
@@ -20,6 +23,7 @@ export function OnboardForm() {
   const [ownerName, setOwnerName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [logo, setLogo] = useState<File | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,17 +32,33 @@ export function OnboardForm() {
     if (!slugTouched) setSlug(slugify(value));
   }
 
+  function handleLogoChange(file: File | undefined) {
+    setError(null);
+    if (!file) return setLogo(null);
+    if (!ALLOWED_LOGO_TYPES.includes(file.type)) return setError("Logo must be a JPEG, PNG, or WebP image.");
+    if (file.size > MAX_LOGO_BYTES) return setError("Logo must be 5MB or smaller.");
+    setLogo(file);
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setSubmitting(true);
 
     try {
-      const res = await fetch("/api/onboard", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ restaurantName, slug, ownerName, email, password }),
-      });
+      // multipart/form-data (not JSON) so the optional logo file can ride
+      // along in the same request — /api/onboard uploads it server-side via
+      // the service-role client once the restaurant row (and its id, needed
+      // for the storage path) exists.
+      const body = new FormData();
+      body.set("restaurantName", restaurantName);
+      body.set("slug", slug);
+      body.set("ownerName", ownerName);
+      body.set("email", email);
+      body.set("password", password);
+      if (logo) body.set("logo", logo);
+
+      const res = await fetch("/api/onboard", { method: "POST", body });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Unable to create your restaurant");
 
@@ -119,6 +139,25 @@ export function OnboardForm() {
               className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm focus:border-neutral-500 focus:outline-none"
             />
             <p className="mt-1 text-xs text-neutral-400">At least 8 characters.</p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-neutral-700">Logo (optional)</label>
+            <div className="mt-1 flex items-center gap-3">
+              {logo ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={URL.createObjectURL(logo)} alt="" className="h-12 w-12 rounded-md border border-neutral-200 object-cover" />
+              ) : (
+                <div className="h-12 w-12 rounded-md border border-dashed border-neutral-300" />
+              )}
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                onChange={(e) => handleLogoChange(e.target.files?.[0])}
+                className="block flex-1 text-xs text-neutral-600"
+              />
+            </div>
+            <p className="mt-1 text-xs text-neutral-400">Shown on the restaurant&apos;s landing page hero. Can be added later too.</p>
           </div>
 
           {error && <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}

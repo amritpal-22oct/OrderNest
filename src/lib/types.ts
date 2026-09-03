@@ -13,7 +13,11 @@ export type Restaurant = {
   free_delivery_threshold_cents: number | null;
   stripe_account_id: string | null;
   stripe_onboarding_complete: boolean;
+  // Platform-billing Customer (cus_...) on OrderNest's own account — separate
+  // from stripe_account_id (the restaurant's own connected Account).
+  stripe_customer_id: string | null;
   is_live: boolean;
+  accepting_orders: boolean;
   delivery_radius_km: number | null;
   timezone: string;
   created_at: string;
@@ -116,6 +120,11 @@ export type Order = {
   status: OrderStatus;
   stripe_checkout_session_id: string | null;
   stripe_payment_intent_id: string | null;
+  stripe_refund_id: string | null;
+  refunded_at: string | null;
+  // Stripe's own Refund.status — the source of truth for whether the money
+  // actually moved, kept in sync by the refund.updated/refund.failed webhook.
+  refund_status: "pending" | "requires_action" | "succeeded" | "failed" | "canceled" | null;
   created_at: string;
   order_items?: OrderItem[];
 };

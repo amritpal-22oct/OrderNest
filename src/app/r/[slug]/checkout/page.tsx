@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import type { MenuItem, RestaurantHours, RestaurantLocation } from "@/lib/types";
 import { isRestaurantOpen } from "@/lib/hours";
+import { getSchedulingAvailability } from "@/lib/scheduling";
 import { CheckoutForm } from "./CheckoutForm";
 
 export default async function CheckoutPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -28,13 +29,37 @@ export default async function CheckoutPage({ params }: { params: Promise<{ slug:
     );
   }
 
+  if (!restaurant.accepting_orders) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-neutral-50 px-4">
+        <div className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 text-center shadow-sm">
+          <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name} isn&apos;t taking orders right now</h1>
+          <p className="mt-2 text-sm text-neutral-500">Please check back later.</p>
+          <Link href={`/r/${slug}/order`} className="mt-6 inline-block text-sm font-medium text-neutral-900 underline">
+            ← Back to menu
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
   const { data: hours } = await supabase
     .from("restaurant_hours")
     .select("*")
     .eq("restaurant_id", restaurant.id)
     .returns<RestaurantHours[]>();
 
-  if (!isRestaurantOpen(hours ?? [], restaurant.timezone)) {
+  // Closed right now doesn't necessarily mean "can't order at all" — a
+  // restaurant with hours configured can still take a *scheduled* order for
+  // a future open slot. Only fully block when there's truly no way to order:
+  // closed now AND (no hours configured is never this case — "unrestricted"
+  // scheduling always has room — or) no upcoming open slot within the
+  // scheduling window either.
+  const openNow = isRestaurantOpen(hours ?? [], restaurant.timezone);
+  const availability = getSchedulingAvailability(hours ?? [], restaurant.timezone);
+  const canScheduleAhead = availability.mode === "unrestricted" || availability.days.length > 0;
+
+  if (!openNow && !canScheduleAhead) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-neutral-50 px-4">
         <div className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 text-center shadow-sm">

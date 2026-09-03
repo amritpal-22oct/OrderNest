@@ -5,7 +5,8 @@ import Script from "next/script";
 import Link from "next/link";
 import type { MenuItem, Restaurant, RestaurantHours, RestaurantLocation } from "@/lib/types";
 import { money } from "@/lib/format";
-import { getSchedulingAvailability } from "@/lib/scheduling";
+import { DAYS_AHEAD, getSchedulingAvailability } from "@/lib/scheduling";
+import { isRestaurantOpen } from "@/lib/hours";
 import { LocationPicker, clearStoredLocation, loadStoredLocation, type ResolvedLocation } from "./LocationPicker";
 
 // Custom Checkout (ui_mode: "elements") — the Payment Element mounts inline
@@ -28,7 +29,7 @@ type StripeCheckout = {
 
 declare global {
   interface Window {
-    Stripe?: (key: string) => {
+    Stripe?: (key: string, opts?: { stripeAccount: string }) => {
       initCheckout: (opts: { clientSecret: string }) => StripeCheckout;
     };
   }
@@ -107,12 +108,24 @@ export function CheckoutForm({
   const [instructions, setInstructions] = useState("");
 
   const availability = useMemo(() => getSchedulingAvailability(hours, restaurant.timezone), [hours, restaurant.timezone]);
-  const [scheduleMode, setScheduleMode] = useState<"asap" | "schedule">("asap");
+  // Computed once at mount, not live-updated while the page sits open — same
+  // tradeoff as the rest of this form's client-side checks; /api/checkout
+  // re-validates against the actual submit time regardless.
+  const openNow = useMemo(() => isRestaurantOpen(hours, restaurant.timezone), [hours, restaurant.timezone]);
+  const [scheduleMode, setScheduleMode] = useState<"asap" | "schedule">(openNow ? "asap" : "schedule");
   const [selectedDate, setSelectedDate] = useState(availability.mode === "slots" ? (availability.days[0]?.date ?? "") : "");
   const [selectedSlotValue, setSelectedSlotValue] = useState(
     availability.mode === "slots" ? (availability.days[0]?.slots[0]?.value ?? "") : ""
   );
-  const [datetimeLocal, setDatetimeLocal] = useState("");
+  // Split date/time (native <input type="date"/"time">) instead of a single
+  // datetime-local field — datetime-local's combined browser widget renders
+  // with an unstyled, oddly-truncated placeholder ("yyyy-mm-dd, --:-- --")
+  // that reads as broken next to the rest of this form's custom controls.
+  const [scheduleDateStr, setScheduleDateStr] = useState("");
+  const [scheduleTimeStr, setScheduleTimeStr] = useState("");
+  const datetimeLocal = scheduleDateStr && scheduleTimeStr ? `${scheduleDateStr}T${scheduleTimeStr}` : "";
+  const todayDateStr = new Date().toISOString().slice(0, 10);
+  const maxDateStr = new Date(Date.now() + DAYS_AHEAD * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
   const selectedDay = availability.mode === "slots" ? availability.days.find((d) => d.date === selectedDate) : undefined;
 
@@ -269,7 +282,13 @@ export function CheckoutForm({
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Unable to start checkout");
 
-      const stripe = window.Stripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY!);
+      // Direct charge — the session lives on the restaurant's connected
+      // account, not the platform, so Stripe.js needs that account context
+      // too, or it 404s ("No such checkout.session") trying to look the
+      // session up in the platform's own account.
+      const stripe = window.Stripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY!, {
+        stripeAccount: restaurant.stripe_account_id!,
+      });
       const checkoutInstance = stripe.initCheckout({ clientSecret: data.clientSecret });
       // Store the instance; the effect below mounts the Payment Element once
       // React has actually committed the #payment-element div (a raw
@@ -346,8 +365,16 @@ export function CheckoutForm({
   return (
     <div className="min-h-screen bg-neutral-50 pb-20">
       {/* Versioned build required for initCheckout (Custom Checkout) — the
-          generic v3 evergreen build doesn't have this method at all. */}
-      <Script src="https://js.stripe.com/clover/stripe.js" onLoad={() => setStripeLoaded(true)} />
+          generic v3 evergreen build doesn't have this method at all.
+          onReady, not onLoad: if this component unmounts and remounts (e.g.
+          the customer hits the browser back button, then forward again),
+          next/script's loadScript() sees the src already in its module-level
+          LoadCache and bails out before ever calling onLoad again — onReady
+          is the prop Next.js specifically built to still fire in that
+          remount case (see node_modules/next/dist/client/script.js). With
+          onLoad, stripeLoaded would stay false forever on remount and the
+          button would be permanently stuck on "Loading payment…". */}
+      <Script src="https://js.stripe.com/clover/stripe.js" onReady={() => setStripeLoaded(true)} />
 
       <header className="border-b border-neutral-200 bg-white">
         <div className="mx-auto max-w-2xl px-6 py-5">
@@ -357,7 +384,11 @@ export function CheckoutForm({
       </header>
 
       <main className="mx-auto max-w-2xl px-6 py-8">
-        <form onSubmit={handleContinueToPayment} className="space-y-6">
+        {/* gap-based, not space-y-6: the fieldset's own reset (border-0 p-0
+            m-0) zeroes the margin space-y relies on, collapsing the gap
+            before the submit button/payment card to 0. Flex gap doesn't
+            depend on children's margins, so it isn't affected. */}
+        <form onSubmit={handleContinueToPayment} className="flex flex-col gap-6">
           {/* Disabled (not hidden) once the payment step starts — the order
               details stay visible and readable, but locked, so payment reads
               as a continuation of this same page rather than a separate one. */}
@@ -430,13 +461,21 @@ export function CheckoutForm({
 
               <div className="mt-4">
                 <label className="block text-sm text-neutral-600">When</label>
+                {!openNow && (
+                  <p className="mt-1 text-xs text-amber-700">
+                    {restaurant.name} is closed right now — you can still schedule an order for when we&apos;re open.
+                  </p>
+                )}
                 <div className="mt-1 flex overflow-hidden rounded-full border border-neutral-200">
                   {(["asap", "schedule"] as const).map((mode) => (
                     <button
                       type="button"
                       key={mode}
+                      disabled={mode === "asap" && !openNow}
                       onClick={() => setScheduleMode(mode)}
-                      className={`flex-1 py-2 text-sm font-medium ${scheduleMode === mode ? "bg-neutral-900 text-white" : "text-neutral-600"}`}
+                      className={`flex-1 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 ${
+                        scheduleMode === mode ? "bg-neutral-900 text-white" : "text-neutral-600"
+                      }`}
                     >
                       {mode === "asap" ? "As soon as possible" : "Schedule for later"}
                     </button>
@@ -445,40 +484,67 @@ export function CheckoutForm({
 
                 {scheduleMode === "schedule" &&
                   (availability.mode === "unrestricted" ? (
-                    <input
-                      type="datetime-local"
-                      value={datetimeLocal}
-                      onChange={(e) => setDatetimeLocal(e.target.value)}
-                      className="mt-2 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
-                    />
+                    <div className="mt-2 grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="mb-1 block text-xs text-neutral-500">Date</label>
+                        <input
+                          type="date"
+                          min={todayDateStr}
+                          max={maxDateStr}
+                          value={scheduleDateStr}
+                          onChange={(e) => setScheduleDateStr(e.target.value)}
+                          className="w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs text-neutral-500">Time</label>
+                        <input
+                          type="time"
+                          value={scheduleTimeStr}
+                          onChange={(e) => setScheduleTimeStr(e.target.value)}
+                          className="w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
+                        />
+                      </div>
+                    </div>
                   ) : (
-                    <div className="mt-2 grid grid-cols-2 gap-2">
-                      <select
-                        value={selectedDate}
-                        onChange={(e) => {
-                          setSelectedDate(e.target.value);
-                          const day = availability.days.find((d) => d.date === e.target.value);
-                          setSelectedSlotValue(day?.slots[0]?.value ?? "");
-                        }}
-                        className="rounded-md border border-neutral-300 px-2 py-2 text-sm"
-                      >
+                    <div className="mt-2 space-y-3">
+                      <div className="flex gap-2 overflow-x-auto pb-1">
                         {availability.days.map((day) => (
-                          <option key={day.date} value={day.date}>
+                          <button
+                            type="button"
+                            key={day.date}
+                            onClick={() => {
+                              setSelectedDate(day.date);
+                              setSelectedSlotValue(day.slots[0]?.value ?? "");
+                            }}
+                            className={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium whitespace-nowrap transition-colors ${
+                              selectedDate === day.date
+                                ? "border-neutral-900 bg-neutral-900 text-white"
+                                : "border-neutral-200 text-neutral-600 hover:border-neutral-300"
+                            }`}
+                          >
                             {day.label}
-                          </option>
+                          </button>
                         ))}
-                      </select>
-                      <select
-                        value={selectedSlotValue}
-                        onChange={(e) => setSelectedSlotValue(e.target.value)}
-                        className="rounded-md border border-neutral-300 px-2 py-2 text-sm"
-                      >
-                        {(selectedDay?.slots ?? []).map((slot) => (
-                          <option key={slot.value} value={slot.value}>
-                            {slot.label}
-                          </option>
-                        ))}
-                      </select>
+                      </div>
+                      {selectedDay && selectedDay.slots.length > 0 && (
+                        <div className="flex flex-wrap gap-2">
+                          {selectedDay.slots.map((slot) => (
+                            <button
+                              type="button"
+                              key={slot.value}
+                              onClick={() => setSelectedSlotValue(slot.value)}
+                              className={`rounded-full border px-3 py-1.5 text-sm font-medium transition-colors ${
+                                selectedSlotValue === slot.value
+                                  ? "border-neutral-900 bg-neutral-900 text-white"
+                                  : "border-neutral-200 text-neutral-600 hover:border-neutral-300"
+                              }`}
+                            >
+                              {slot.label}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
               </div>
