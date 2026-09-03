@@ -33,11 +33,16 @@ export default async function PlatformAdminPage() {
             <h1 className="text-lg font-semibold text-neutral-900">OrderNest platform admin</h1>
             <p className="text-sm text-neutral-500">Signed in as {user.email}</p>
           </div>
-          <form action={signOutAction}>
-            <button type="submit" className="text-sm text-neutral-500 hover:text-neutral-900">
-              Sign out
-            </button>
-          </form>
+          <div className="flex items-center gap-4">
+            <Link href="/onboard" className="text-sm text-neutral-500 hover:text-neutral-900">
+              + Add restaurant
+            </Link>
+            <form action={signOutAction}>
+              <button type="submit" className="text-sm text-neutral-500 hover:text-neutral-900">
+                Sign out
+              </button>
+            </form>
+          </div>
         </div>
       </header>
 

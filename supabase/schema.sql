@@ -28,6 +28,30 @@ create table restaurants (
   stripe_account_id text,
   stripe_onboarding_complete boolean not null default false,
   is_live boolean not null default false,
+  delivery_radius_km numeric,
+  created_at timestamptz not null default now()
+);
+
+-- A physical location of a restaurant. Menu/pricing (tax_rate, delivery_fee_cents,
+-- free_delivery_threshold_cents, delivery_radius_km) stay per-restaurant, shared
+-- across all of a restaurant's locations — this table only adds geography and
+-- per-location delivery/pickup availability, not per-location menus or pricing.
+create table restaurant_locations (
+  id uuid primary key default gen_random_uuid(),
+  restaurant_id uuid not null references restaurants(id) on delete cascade,
+  name text not null,
+  address_line1 text not null,
+  address_line2 text,
+  city text not null,
+  province text not null,
+  postal_code text not null,
+  country text not null default 'CA',
+  lat double precision not null,
+  lng double precision not null,
+  supports_delivery boolean not null default true,
+  supports_pickup boolean not null default true,
+  is_active boolean not null default true,
+  sort_order integer not null default 0,
   created_at timestamptz not null default now()
 );
 
@@ -75,6 +99,7 @@ create table orders (
   fulfillment_mode text not null check (fulfillment_mode in ('delivery', 'pickup')),
   delivery_address jsonb,
   pickup_time text,
+  location_id uuid references restaurant_locations(id) on delete set null,
   subtotal_cents integer not null,
   delivery_fee_cents integer not null default 0,
   tax_cents integer not null default 0,
@@ -99,9 +124,11 @@ create table order_items (
 -- ---------- Indexes ----------
 
 create index restaurant_admins_user_id_idx on restaurant_admins (user_id);
+create index restaurant_locations_restaurant_id_idx on restaurant_locations (restaurant_id);
 create index menu_categories_restaurant_id_idx on menu_categories (restaurant_id);
 create index menu_items_restaurant_id_idx on menu_items (restaurant_id);
 create index orders_restaurant_id_created_at_idx on orders (restaurant_id, created_at desc);
+create index orders_location_id_idx on orders (location_id);
 -- Enforces webhook idempotency: checkout.session.completed retries must not create duplicate orders.
 create unique index orders_stripe_checkout_session_id_key on orders (stripe_checkout_session_id) where stripe_checkout_session_id is not null;
 create index order_items_order_id_idx on order_items (order_id);
@@ -110,6 +137,7 @@ create index order_items_order_id_idx on order_items (order_id);
 
 alter table platform_admins enable row level security;
 alter table restaurants enable row level security;
+alter table restaurant_locations enable row level security;
 alter table restaurant_admins enable row level security;
 alter table menu_categories enable row level security;
 alter table menu_items enable row level security;
@@ -138,6 +166,11 @@ create policy "platform admins manage restaurants" on restaurants
   for all using (is_platform_admin()) with check (is_platform_admin());
 create policy "restaurant admins update their own restaurant" on restaurants
   for update using (is_restaurant_admin(id)) with check (is_restaurant_admin(id));
+
+create policy "restaurant locations are publicly readable" on restaurant_locations
+  for select using (true);
+create policy "restaurant admins manage their locations" on restaurant_locations
+  for all using (is_restaurant_admin(restaurant_id)) with check (is_restaurant_admin(restaurant_id));
 
 create policy "admins see their own restaurant_admins rows" on restaurant_admins
   for select using (user_id = auth.uid() or is_platform_admin());

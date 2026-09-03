@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { createClient } from "@/lib/supabase/server";
+import { isPlatformAdmin } from "@/lib/platform-admin";
 
 const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
@@ -9,7 +11,25 @@ const SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 // deliberately blocked by RLS (only platform admins can normally do this),
 // so this trusted server route is the one sanctioned bypass, and it does its
 // own validation up front rather than relying on RLS to catch mistakes.
+//
+// Gated to platform admins only — onboarding used to be public self-serve
+// signup, but with no CAPTCHA/rate-limiting and zero platform fee (no billing
+// gate to throttle abuse), that's not safe to leave open pre-launch. Can't
+// reuse requirePlatformAdmin() here: it calls redirect(), which inside a
+// Route Handler hit via fetch() would make the client's res.json() choke on
+// a followed redirect instead of getting a clean JSON error.
 export async function POST(request: NextRequest) {
+  const authClient = await createClient();
+  const {
+    data: { user },
+  } = await authClient.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+  }
+  if (!(await isPlatformAdmin(authClient, user.id))) {
+    return NextResponse.json({ error: "Not authorized" }, { status: 403 });
+  }
+
   let body: { restaurantName?: string; slug?: string; ownerName?: string; email?: string; password?: string };
   try {
     body = await request.json();

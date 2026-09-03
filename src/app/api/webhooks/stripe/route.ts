@@ -73,6 +73,7 @@ async function fulfillOrder(sessionId: string) {
       fulfillment_mode: meta.fulfillment_mode ?? "pickup",
       delivery_address: meta.delivery_address ? JSON.parse(meta.delivery_address) : null,
       pickup_time: meta.pickup_time || null,
+      location_id: meta.location_id || null,
       subtotal_cents: subtotalCents,
       delivery_fee_cents: deliveryFeeCents,
       tax_cents: taxCents,

@@ -14,6 +14,26 @@ export type Restaurant = {
   stripe_account_id: string | null;
   stripe_onboarding_complete: boolean;
   is_live: boolean;
+  delivery_radius_km: number | null;
+  created_at: string;
+};
+
+export type RestaurantLocation = {
+  id: string;
+  restaurant_id: string;
+  name: string;
+  address_line1: string;
+  address_line2: string | null;
+  city: string;
+  province: string;
+  postal_code: string;
+  country: string;
+  lat: number;
+  lng: number;
+  supports_delivery: boolean;
+  supports_pickup: boolean;
+  is_active: boolean;
+  sort_order: number;
   created_at: string;
 };
 
@@ -60,6 +80,7 @@ export type Order = {
   fulfillment_mode: "delivery" | "pickup";
   delivery_address: Record<string, string> | null;
   pickup_time: string | null;
+  location_id: string | null;
   subtotal_cents: number;
   delivery_fee_cents: number;
   tax_cents: number;

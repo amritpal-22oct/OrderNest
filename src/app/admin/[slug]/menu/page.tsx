@@ -39,9 +39,14 @@ export default async function MenuManagementPage({ params }: { params: Promise<{
             <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name}</h1>
             <p className="text-sm text-neutral-500">Menu</p>
           </div>
-          <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
-            ← Orders
-          </Link>
+          <div className="flex items-center gap-4">
+            <Link href={`/admin/${slug}/locations`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Locations
+            </Link>
+            <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              ← Orders
+            </Link>
+          </div>
         </div>
       </header>
 

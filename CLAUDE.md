@@ -190,6 +190,53 @@ put the same value in `.env.local` as both `STRIPE_WEBHOOK_SECRET` and
 secret is regenerated every time `stripe listen` restarts, so both vars need updating again if the
 listener is ever stopped/restarted — they'll drift out of sync if you only update one.
 
+## Multi-location delivery
+
+A `restaurants` row can have multiple `restaurant_locations` (name, structured address, `lat`/`lng`,
+`supports_delivery`/`supports_pickup`, `is_active`). Menu and pricing (`tax_rate`,
+`delivery_fee_cents`, `free_delivery_threshold_cents`) stay per-restaurant, shared across all of a
+restaurant's locations — this feature only adds geography and delivery feasibility, not per-location
+menus or pricing. The delivery radius is **one value per restaurant**
+(`restaurants.delivery_radius_km`, nullable = unlimited), not per-location, applying no matter which
+location ends up nearest. All locations share the restaurant's single existing
+`stripe_account_id` — no Connect changes.
+
+**Zero or one location = skip entirely.** This is the load-bearing backward-compatibility rule: a
+restaurant with fewer than 2 rows in `restaurant_locations` (every existing tenant today, e.g.
+`mithaas-cafe`) gets no picker UI, no radius check, both fulfillment modes always available — exactly
+the pre-this-feature behavior. With exactly one location, its `id` is still captured on the order for
+attribution, but its `supports_delivery`/`supports_pickup` flags and the restaurant's radius are
+**not** enforced — a deliberate scope line, not an oversight, if it ever needs tightening.
+
+**Nearest-location flow** (`src/app/r/[slug]/checkout/LocationPicker.tsx`, only rendered when
+`locations.length > 1`): tries `navigator.geolocation.getCurrentPosition()` first; on denial/error, an
+always-visible typed-address field falls back to `POST /api/geocode` (server-side Mapbox proxy —
+`MAPBOX_TOKEN` never reaches the browser). Either path yields `{lat, lng}`; nearest location is
+`haversineDistanceKm()` (`src/lib/geo.ts`) client-side. Result persists to
+`localStorage["ordernest_location_" + slug]` (same convention as `ordernest_cart_<slug>`).
+
+**Server-side re-validation is mandatory, like pricing.** `/api/checkout` re-fetches active locations
+and re-runs the same distance check server-side before creating the Stripe session — a tampered
+request can't force a delivery order outside the radius just because the client-side picker allowed
+it. Out-of-radius/unsupported-mode requests get a **400 rejection**, not a silent downgrade to
+pickup — changing what the customer is charged/fulfilled without their explicit re-confirmation would
+be worse than a clear error. `orders.location_id` (nullable FK) records which location fulfilled the
+order, shown on the admin orders dashboard.
+
+**Geocoding is a single plain `fetch` against Mapbox's REST API** (`src/lib/geocode.ts`,
+`geocodeAddress()`) — no SDK, since this is the only geo call in the app. All Mapbox specifics are
+isolated to that one function; swapping providers later (e.g. Google Maps) means rewriting its
+internals only, since every caller (`/api/geocode`, the admin locations actions) just consumes its
+`{lat, lng, formattedAddress} | null` return shape.
+
+**Known gap, not fixed:** `/api/geocode` is necessarily public (anonymous customers call it) with no
+rate limiting — same class of issue as the pre-fix `/onboard` below, lower stakes (Mapbox quota cost,
+not account creation).
+
+**Known gotcha (same trap as `menu_categories`):** `restaurant_locations.sort_order` defaults to `0`,
+so newly-added locations render **first** in the admin list, not last — the admin query orders by
+`sort_order, created_at` to keep this predictable rather than surprising.
+
 ## Planned routes
 
 - `/r/[slug]` — public ordering page per restaurant (**built**: menu browsing by
@@ -212,12 +259,23 @@ listener is ever stopped/restarted — they'll drift out of sync if you only upd
   Also shows a "Connect Stripe" banner/button when `stripe_onboarding_complete` is false.
 - `/admin/[slug]/connect/return` and `/admin/[slug]/connect/refresh` — Stripe's hosted-onboarding
   redirect targets (**built**, see Stripe Connect section above)
-- `/onboard` — **built**: new restaurant signup flow. `POST /api/onboard` (service-role client,
-  bypasses RLS) validates inputs, creates the Supabase Auth user, `restaurants` row, and
-  `restaurant_admins` link (role `owner`) — best-effort cleanup on partial failure since it's not
-  a real DB transaction. Client form (`src/app/onboard/page.tsx`) auto-slugifies the restaurant
-  name, then signs the new user in and redirects to `/admin/[slug]`. Verified end-to-end via
-  browser (signup → auto sign-in → redirect → empty dashboard with "Stripe isn't connected yet").
+- `/onboard` — **built, platform-admin-gated** (not public self-serve — see "Not built yet" for why):
+  new restaurant signup flow. `src/app/onboard/page.tsx` is now a server component calling
+  `requirePlatformAdmin()`, wrapping the actual form (moved to `OnboardForm.tsx`, unchanged
+  otherwise). `POST /api/onboard` independently checks the caller is a signed-in platform admin at
+  the top of the handler (can't reuse `requirePlatformAdmin()` there — it calls `redirect()`, which
+  inside a `fetch()`-hit Route Handler would make the client's `res.json()` choke on a followed
+  redirect instead of a clean error), then proceeds exactly as before via the service-role client:
+  validates inputs, creates the Supabase Auth user, `restaurants` row, and `restaurant_admins` link
+  (role `owner`) — best-effort cleanup on partial failure since it's not a real DB transaction. Signs
+  the new user in client-side and redirects to `/admin/[slug]`. Linked from `/platform-admin`'s
+  "+ Add restaurant". Verified end-to-end via browser (signup → auto sign-in → redirect → empty
+  dashboard with "Stripe isn't connected yet"), predating the platform-admin gate added later.
+- `/admin/[slug]/locations` — **built**: multi-location CRUD for restaurant admins (add/edit/
+  deactivate/delete a location, set the restaurant's delivery radius) — see "Multi-location delivery"
+  above. Same Server Action pattern as `/admin/[slug]/menu`.
+- `/api/geocode` — **built**: public `POST {address}` proxy to Mapbox, used by the customer-facing
+  location picker's typed-address fallback — see "Multi-location delivery" above.
 - `/admin/[slug]/menu` — **built**: menu management for restaurant admins. Server Actions
   (`src/app/admin/[slug]/menu/actions.ts`) for add/edit/delete category, add/edit/delete item,
   toggle availability — all authorized via existing RLS policies (session-scoped client, no
@@ -267,10 +325,12 @@ listener is ever stopped/restarted — they'll drift out of sync if you only upd
    `stripe listen` are all outstanding.
 2. **Restaurant settings UI** — `tax_rate`, `delivery_fee_cents`, `free_delivery_threshold_cents`,
    currency, etc. exist as DB columns (read by checkout/menu pages) but have no admin UI; only
-   editable by hand via SQL/seed today.
+   editable by hand via SQL/seed today. (`delivery_radius_km` is the one exception — editable from
+   `/admin/[slug]/locations`, see "Multi-location delivery" above.)
 3. **Auth completeness** — no password reset flow, no way to invite a second admin to an existing
    restaurant (`restaurant_admins` supports multiple rows, but only onboarding's initial owner
-   insert exists), no rate limiting/abuse protection on the public `/onboard` signup endpoint.
+   insert exists). `/onboard` itself is no longer public (platform-admin-gated), but
+   `/api/geocode` still is, with no rate limiting — see "Multi-location delivery" above.
 4. **Order lifecycle beyond "paid"** — no refund/cancellation handling, no customer-facing order
    status notifications (email/SMS) when status changes.
 5. **Branding/customization per tenant** — no logo/image upload for restaurants or menu items

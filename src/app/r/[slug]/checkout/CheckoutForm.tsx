@@ -3,8 +3,9 @@
 import { useEffect, useMemo, useState } from "react";
 import Script from "next/script";
 import Link from "next/link";
-import type { MenuItem, Restaurant } from "@/lib/types";
+import type { MenuItem, Restaurant, RestaurantLocation } from "@/lib/types";
 import { money } from "@/lib/format";
+import { LocationPicker, clearStoredLocation, loadStoredLocation, type ResolvedLocation } from "./LocationPicker";
 
 type EmbeddedCheckout = { mount: (selector: string) => void };
 
@@ -27,7 +28,15 @@ function loadCart(slug: string): Cart {
   }
 }
 
-export function CheckoutForm({ restaurant, items }: { restaurant: Restaurant; items: MenuItem[] }) {
+export function CheckoutForm({
+  restaurant,
+  items,
+  locations,
+}: {
+  restaurant: Restaurant;
+  items: MenuItem[];
+  locations: RestaurantLocation[];
+}) {
   const [cart, setCart] = useState<Cart>({});
   const [hydrated, setHydrated] = useState(false);
   const [stripeLoaded, setStripeLoaded] = useState(false);
@@ -35,6 +44,31 @@ export function CheckoutForm({ restaurant, items }: { restaurant: Restaurant; it
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingCheckout, setPendingCheckout] = useState<EmbeddedCheckout | null>(null);
+
+  // Fewer than 2 locations: skip the picker entirely, exactly today's behavior
+  // (no radius check, both fulfillment modes always available).
+  const needsPicker = locations.length > 1;
+  const [resolvedLocation, setResolvedLocation] = useState<ResolvedLocation | null>(null);
+
+  useEffect(() => {
+    if (needsPicker) setResolvedLocation(loadStoredLocation(restaurant.slug, locations));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restaurant.slug, needsPicker]);
+
+  const activeLocation = needsPicker
+    ? (locations.find((l) => l.id === resolvedLocation?.locationId) ?? null)
+    : (locations[0] ?? null);
+
+  const deliveryAllowed = needsPicker
+    ? !!activeLocation?.supports_delivery &&
+      (restaurant.delivery_radius_km == null || (resolvedLocation?.distanceKm ?? Infinity) <= restaurant.delivery_radius_km)
+    : true;
+  const pickupAllowed = needsPicker ? !!activeLocation?.supports_pickup : true;
+
+  useEffect(() => {
+    if (fulfillmentMode === "delivery" && !deliveryAllowed && pickupAllowed) setFulfillmentMode("pickup");
+    else if (fulfillmentMode === "pickup" && !pickupAllowed && deliveryAllowed) setFulfillmentMode("delivery");
+  }, [deliveryAllowed, pickupAllowed, fulfillmentMode]);
 
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -104,6 +138,9 @@ export function CheckoutForm({ restaurant, items }: { restaurant: Restaurant; it
               ? { address1: address1.trim(), city: city.trim(), province: province.trim(), postal: postal.trim().toUpperCase(), instructions: instructions.trim() }
               : null,
           pickupTime: fulfillmentMode === "pickup" ? pickupTime : null,
+          locationId: activeLocation?.id ?? null,
+          customerLat: needsPicker ? (resolvedLocation?.lat ?? null) : null,
+          customerLng: needsPicker ? (resolvedLocation?.lng ?? null) : null,
         }),
       });
       const data = await res.json();
@@ -136,6 +173,22 @@ export function CheckoutForm({ restaurant, items }: { restaurant: Restaurant; it
     );
   }
 
+  if (needsPicker && !resolvedLocation) {
+    return (
+      <div className="min-h-screen bg-neutral-50 pb-20">
+        <header className="border-b border-neutral-200 bg-white">
+          <div className="mx-auto max-w-2xl px-6 py-5">
+            <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name}</h1>
+            <p className="text-sm text-neutral-500">Checkout</p>
+          </div>
+        </header>
+        <main className="mx-auto max-w-2xl px-6 py-8">
+          <LocationPicker slug={restaurant.slug} locations={locations} onResolved={setResolvedLocation} />
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-neutral-50 pb-20">
       <Script src="https://js.stripe.com/v3/" onLoad={() => setStripeLoaded(true)} />
@@ -152,20 +205,49 @@ export function CheckoutForm({ restaurant, items }: { restaurant: Restaurant; it
           <form onSubmit={handleSubmit} className="space-y-6">
             <div className="rounded-xl border border-neutral-200 bg-white p-5">
               <h2 className="font-medium text-neutral-900">Delivery or pickup</h2>
-              <div className="mt-3 flex overflow-hidden rounded-full border border-neutral-200">
-                {(["delivery", "pickup"] as const).map((mode) => (
+
+              {needsPicker && activeLocation && (
+                <div className="mt-2 flex items-center justify-between text-sm text-neutral-500">
+                  <span>Nearest location: {activeLocation.name}</span>
                   <button
                     type="button"
-                    key={mode}
-                    onClick={() => setFulfillmentMode(mode)}
-                    className={`flex-1 py-2 text-sm font-medium capitalize ${
-                      fulfillmentMode === mode ? "bg-neutral-900 text-white" : "text-neutral-600"
-                    }`}
+                    onClick={() => {
+                      clearStoredLocation(restaurant.slug);
+                      setResolvedLocation(null);
+                    }}
+                    className="text-neutral-500 underline hover:text-neutral-900"
                   >
-                    {mode}
+                    Change location
                   </button>
-                ))}
+                </div>
+              )}
+
+              <div className="mt-3 flex overflow-hidden rounded-full border border-neutral-200">
+                {(["delivery", "pickup"] as const).map((mode) => {
+                  const allowed = mode === "delivery" ? deliveryAllowed : pickupAllowed;
+                  return (
+                    <button
+                      type="button"
+                      key={mode}
+                      disabled={!allowed}
+                      onClick={() => setFulfillmentMode(mode)}
+                      className={`flex-1 py-2 text-sm font-medium capitalize disabled:cursor-not-allowed disabled:opacity-40 ${
+                        fulfillmentMode === mode ? "bg-neutral-900 text-white" : "text-neutral-600"
+                      }`}
+                    >
+                      {mode}
+                    </button>
+                  );
+                })}
               </div>
+
+              {needsPicker && !deliveryAllowed && activeLocation && (
+                <p className="mt-2 text-sm text-amber-700">
+                  {activeLocation.supports_delivery
+                    ? `You're ${resolvedLocation?.distanceKm.toFixed(1)} km from ${activeLocation.name} — outside our ${restaurant.delivery_radius_km}km delivery area, but pickup is available there.`
+                    : `${activeLocation.name} doesn't offer delivery — pickup only.`}
+                </p>
+              )}
 
               {fulfillmentMode === "delivery" ? (
                 <div className="mt-4 space-y-3">

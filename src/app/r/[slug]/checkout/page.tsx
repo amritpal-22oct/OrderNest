@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import type { MenuItem } from "@/lib/types";
+import type { MenuItem, RestaurantLocation } from "@/lib/types";
 import { CheckoutForm } from "./CheckoutForm";
 
 export default async function CheckoutPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -33,5 +33,14 @@ export default async function CheckoutPage({ params }: { params: Promise<{ slug:
     .eq("restaurant_id", restaurant.id)
     .returns<MenuItem[]>();
 
-  return <CheckoutForm restaurant={restaurant} items={items ?? []} />;
+  const { data: locations } = await supabase
+    .from("restaurant_locations")
+    .select("*")
+    .eq("restaurant_id", restaurant.id)
+    .eq("is_active", true)
+    .order("sort_order")
+    .order("created_at")
+    .returns<RestaurantLocation[]>();
+
+  return <CheckoutForm restaurant={restaurant} items={items ?? []} locations={locations ?? []} />;
 }

@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { stripe, STRIPE_FEE_PERCENT, STRIPE_FEE_FIXED_CENTS } from "@/lib/stripe";
 import { priceCart } from "@/lib/cart-pricing";
-import type { Restaurant } from "@/lib/types";
+import { haversineDistanceKm } from "@/lib/geo";
+import type { Restaurant, RestaurantLocation } from "@/lib/types";
 
 function randomLetters(n: number) {
   const letters = "abcdefghijklmnopqrstuvwxyz";
@@ -17,6 +18,9 @@ export async function POST(request: NextRequest) {
     customer?: { name?: string; email?: string; phone?: string };
     delivery?: { address1?: string; city?: string; province?: string; postal?: string; instructions?: string } | null;
     pickupTime?: string | null;
+    locationId?: string | null;
+    customerLat?: number | null;
+    customerLng?: number | null;
   };
 
   try {
@@ -25,7 +29,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
-  const { slug, cart, fulfillmentMode, customer, delivery, pickupTime } = body;
+  const { slug, cart, fulfillmentMode, customer, delivery, pickupTime, locationId, customerLat, customerLng } = body;
 
   if (!slug || !cart || Object.keys(cart).length === 0) {
     return NextResponse.json({ error: "Cart is empty" }, { status: 400 });
@@ -52,6 +56,49 @@ export async function POST(request: NextRequest) {
   }
   if (!restaurant.stripe_account_id || !restaurant.stripe_onboarding_complete) {
     return NextResponse.json({ error: "This restaurant isn't accepting payments yet" }, { status: 400 });
+  }
+
+  // Multi-location gating: menu/pricing stay restaurant-wide regardless of
+  // location (see priceCart below), this only decides whether the chosen
+  // fulfillment mode is actually offered at the resolved location. Fewer than
+  // 2 active locations mirrors the client's "skip entirely" behavior — no
+  // gating, same as before this feature existed.
+  const { data: locations } = await supabase
+    .from("restaurant_locations")
+    .select("*")
+    .eq("restaurant_id", restaurant.id)
+    .eq("is_active", true)
+    .returns<RestaurantLocation[]>();
+
+  let resolvedLocation: RestaurantLocation | null = null;
+  if (locations && locations.length > 1) {
+    resolvedLocation = locations.find((l) => l.id === locationId) ?? null;
+    if (!resolvedLocation) {
+      return NextResponse.json({ error: "Invalid location" }, { status: 400 });
+    }
+    if (fulfillmentMode === "delivery") {
+      if (!resolvedLocation.supports_delivery) {
+        return NextResponse.json({ error: `${resolvedLocation.name} doesn't offer delivery.` }, { status: 400 });
+      }
+      if (typeof customerLat !== "number" || typeof customerLng !== "number") {
+        return NextResponse.json({ error: "Missing delivery location" }, { status: 400 });
+      }
+      if (restaurant.delivery_radius_km != null) {
+        const distanceKm = haversineDistanceKm({ lat: customerLat, lng: customerLng }, resolvedLocation);
+        if (distanceKm > restaurant.delivery_radius_km) {
+          return NextResponse.json(
+            {
+              error: `You're outside ${restaurant.name}'s ${restaurant.delivery_radius_km}km delivery radius from ${resolvedLocation.name}. Please choose pickup instead.`,
+            },
+            { status: 400 },
+          );
+        }
+      }
+    } else if (!resolvedLocation.supports_pickup) {
+      return NextResponse.json({ error: `${resolvedLocation.name} doesn't offer pickup.` }, { status: 400 });
+    }
+  } else if (locations && locations.length === 1) {
+    resolvedLocation = locations[0];
   }
 
   const priced = await priceCart(restaurant, cart, fulfillmentMode);
@@ -106,6 +153,7 @@ export async function POST(request: NextRequest) {
         customer_phone: customer.phone,
         pickup_time: pickupTime || "",
         delivery_address: fulfillmentMode === "delivery" ? JSON.stringify(delivery) : "",
+        location_id: resolvedLocation?.id ?? "",
       },
     });
 

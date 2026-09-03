@@ -21,10 +21,10 @@ export default async function AdminOrdersPage({ params }: { params: Promise<{ sl
 
   const { data: orders } = await supabase
     .from("orders")
-    .select("*, order_items(*)")
+    .select("*, order_items(*), location:restaurant_locations(name)")
     .eq("restaurant_id", restaurant.id)
     .order("created_at", { ascending: false })
-    .returns<Order[]>();
+    .returns<(Order & { location: { name: string } | null })[]>();
 
   return (
     <div className="min-h-screen bg-neutral-50">
@@ -37,6 +37,9 @@ export default async function AdminOrdersPage({ params }: { params: Promise<{ sl
           <div className="flex items-center gap-4">
             <Link href={`/admin/${slug}/menu`} className="text-sm text-neutral-500 hover:text-neutral-900">
               Menu
+            </Link>
+            <Link href={`/admin/${slug}/locations`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Locations
             </Link>
             <form action={signOutAction}>
               <input type="hidden" name="slug" value={slug} />
@@ -93,6 +96,7 @@ export default async function AdminOrdersPage({ params }: { params: Promise<{ sl
                     {order.fulfillment_mode === "delivery"
                       ? `Delivering to: ${order.delivery_address?.address1 ?? ""}, ${order.delivery_address?.city ?? ""}`
                       : `Pickup: ${order.pickup_time ?? ""}`}
+                    {order.location?.name && <span className="text-neutral-400"> · {order.location.name}</span>}
                   </p>
                   <ul className="mt-2 space-y-1 text-neutral-600">
                     {order.order_items?.map((item) => (

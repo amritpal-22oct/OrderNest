@@ -1,5 +1,11 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+export async function isPlatformAdmin(supabase: SupabaseClient, userId: string) {
+  const { data } = await supabase.from("platform_admins").select("id").eq("id", userId).maybeSingle();
+  return !!data;
+}
 
 // Server Component guard for /platform-admin pages. Mirrors
 // requireRestaurantAdmin's shape but checks platform_admins instead — RLS
@@ -16,9 +22,7 @@ export async function requirePlatformAdmin() {
     redirect("/platform-admin/login");
   }
 
-  const { data: platformAdmin } = await supabase.from("platform_admins").select("id").eq("id", user.id).maybeSingle();
-
-  if (!platformAdmin) {
+  if (!(await isPlatformAdmin(supabase, user.id))) {
     redirect("/platform-admin/login?error=not-authorized");
   }
 
