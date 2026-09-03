@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { requireRestaurantAdmin } from "@/lib/restaurant";
 import type { Order, OrderStatus } from "@/lib/types";
 import { money } from "@/lib/format";
@@ -33,12 +34,17 @@ export default async function AdminOrdersPage({ params }: { params: Promise<{ sl
             <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name}</h1>
             <p className="text-sm text-neutral-500">Orders · signed in as {user.email}</p>
           </div>
-          <form action={signOutAction}>
-            <input type="hidden" name="slug" value={slug} />
-            <button type="submit" className="text-sm text-neutral-500 hover:text-neutral-900">
-              Sign out
-            </button>
-          </form>
+          <div className="flex items-center gap-4">
+            <Link href={`/admin/${slug}/menu`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Menu
+            </Link>
+            <form action={signOutAction}>
+              <input type="hidden" name="slug" value={slug} />
+              <button type="submit" className="text-sm text-neutral-500 hover:text-neutral-900">
+                Sign out
+              </button>
+            </form>
+          </div>
         </div>
       </header>
 
