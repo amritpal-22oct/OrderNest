@@ -248,6 +248,32 @@ fires per keystroke rather than once per checkout.
 so newly-added locations render **first** in the admin list, not last — the admin query orders by
 `sort_order, created_at` to keep this predictable rather than surprising.
 
+## Hours of operation
+
+Per-restaurant, per-day-of-week schedule (`restaurant_hours`: `day_of_week` 0=Sunday..6=Saturday,
+`is_closed`, `open_time`/`close_time` as Postgres `time`), plus `restaurants.timezone` (IANA name,
+default `America/Toronto`). Enforced, not just informational: `/r/[slug]/checkout` blocks with a
+"currently closed" screen server-side, `/api/checkout` independently re-checks and rejects with 400
+(same "never trust the client alone" pattern as the delivery-radius check — a checkout page loaded
+before closing time could still submit after), and the menu page (`/r/[slug]`) shows a non-blocking
+amber banner so browsing still works while closed.
+
+**No rows at all = always open** — the load-bearing backward-compatibility rule, identical in spirit
+to "zero locations = skip entirely": every existing tenant (e.g. `mithaas-cafe`) has no
+`restaurant_hours` rows and is completely unaffected until an admin explicitly saves hours.
+`/admin/[slug]/hours` always saves **all 7 days at once** (a single upsert on the
+`restaurant_id, day_of_week` unique constraint) specifically to avoid a half-configured week ever
+existing — partial state was a real risk here since each day's checkbox+time inputs are independent.
+
+**`isRestaurantOpen()` / `getTodayHours()`** (`src/lib/hours.ts`) read the restaurant's local
+day-of-week and time via `Intl.DateTimeFormat` with the `timeZone` option — no date library
+dependency, same "plain platform API, no SDK" choice as `geocode.ts`. Handles overnight-wrap hours
+(e.g. Friday 18:00–02:00) by also checking *yesterday's* row for a carry-over into early this
+morning — verified with 8 scripted test cases via `npx tsx` (normal range, closed day, and all three
+overnight-wrap edges: still-open late stretch, carried-over early morning, and past-close) before
+wiring it into the two checkout gates. Not covered by an actual test file yet — the verification was
+a one-off script, not a committed test (see "Not built yet": no automated tests exist in this repo).
+
 ## Planned routes
 
 - `/r/[slug]` — public ordering page per restaurant (**built**: menu browsing by
@@ -285,8 +311,11 @@ so newly-added locations render **first** in the admin list, not last — the ad
 - `/admin/[slug]/locations` — **built**: multi-location CRUD for restaurant admins (add/edit/
   deactivate/delete a location, set the restaurant's delivery radius) — see "Multi-location delivery"
   above. Same Server Action pattern as `/admin/[slug]/menu`.
-- `/api/geocode` — **built**: public `POST {address}` proxy to Mapbox, used by the customer-facing
-  location picker's typed-address fallback — see "Multi-location delivery" above.
+- `/api/geocode` and `/api/geocode/suggest` — **built**: public Mapbox proxies (one-shot resolve, and
+  debounced autocomplete respectively) used by the customer-facing location picker — see
+  "Multi-location delivery" above.
+- `/admin/[slug]/hours` — **built**: per-day operating-hours editor (all 7 days saved as one batch
+  upsert) — see "Hours of operation" above.
 - `/admin/[slug]/menu` — **built**: menu management for restaurant admins. Server Actions
   (`src/app/admin/[slug]/menu/actions.ts`) for add/edit/delete category, add/edit/delete item,
   toggle availability — all authorized via existing RLS policies (session-scoped client, no
@@ -336,15 +365,17 @@ so newly-added locations render **first** in the admin list, not last — the ad
    `stripe listen` are all outstanding.
 2. **Restaurant settings UI** — `tax_rate`, `delivery_fee_cents`, `free_delivery_threshold_cents`,
    currency, etc. exist as DB columns (read by checkout/menu pages) but have no admin UI; only
-   editable by hand via SQL/seed today. (`delivery_radius_km` is the one exception — editable from
-   `/admin/[slug]/locations`, see "Multi-location delivery" above.)
+   editable by hand via SQL/seed today. (`delivery_radius_km` and `timezone` are the exceptions —
+   editable from `/admin/[slug]/locations` and `/admin/[slug]/hours` respectively.)
 3. **Auth completeness** — no password reset flow, no way to invite a second admin to an existing
    restaurant (`restaurant_admins` supports multiple rows, but only onboarding's initial owner
    insert exists). `/onboard` itself is no longer public (platform-admin-gated), but
-   `/api/geocode` still is, with no rate limiting — see "Multi-location delivery" above.
+   `/api/geocode` and `/api/geocode/suggest` still are, with no rate limiting — see "Multi-location
+   delivery" above.
 4. **Order lifecycle beyond "paid"** — no refund/cancellation handling, no customer-facing order
    status notifications (email/SMS) when status changes.
 5. **Branding/customization per tenant** — no logo/image upload for restaurants or menu items
    (emoji only today), no custom domain support.
-6. Automated tests — none yet (all verification so far has been manual/live browser + DB checks).
+6. Automated tests — none yet (all verification so far has been manual/live browser + DB checks, plus
+   one one-off `npx tsx` script for `isRestaurantOpen()`'s edge cases — not a committed test file).
 

@@ -41,6 +41,9 @@ export default async function AdminOrdersPage({ params }: { params: Promise<{ sl
             <Link href={`/admin/${slug}/locations`} className="text-sm text-neutral-500 hover:text-neutral-900">
               Locations
             </Link>
+            <Link href={`/admin/${slug}/hours`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Hours
+            </Link>
             <form action={signOutAction}>
               <input type="hidden" name="slug" value={slug} />
               <button type="submit" className="text-sm text-neutral-500 hover:text-neutral-900">

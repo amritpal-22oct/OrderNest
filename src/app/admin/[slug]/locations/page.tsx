@@ -33,6 +33,9 @@ export default async function LocationsManagementPage({ params }: { params: Prom
             <Link href={`/admin/${slug}/menu`} className="text-sm text-neutral-500 hover:text-neutral-900">
               Menu
             </Link>
+            <Link href={`/admin/${slug}/hours`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Hours
+            </Link>
             <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
               ← Orders
             </Link>

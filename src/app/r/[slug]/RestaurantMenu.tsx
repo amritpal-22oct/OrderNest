@@ -24,10 +24,12 @@ export function RestaurantMenu({
   restaurant,
   categories,
   items,
+  isOpen,
 }: {
   restaurant: Restaurant;
   categories: MenuCategory[];
   items: MenuItem[];
+  isOpen: boolean;
 }) {
   const [cart, setCart] = useState<Cart>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -104,6 +106,15 @@ export function RestaurantMenu({
           </button>
         </div>
       </header>
+
+      {!isOpen && (
+        <div className="mx-auto max-w-4xl px-6 pt-6">
+          <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            {restaurant.name} is currently closed — you can browse the menu, but ordering isn&apos;t available right
+            now.
+          </p>
+        </div>
+      )}
 
       <main className="mx-auto max-w-4xl px-6 py-8">
         {categories.length === 0 ? (

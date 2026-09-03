@@ -29,7 +29,21 @@ create table restaurants (
   stripe_onboarding_complete boolean not null default false,
   is_live boolean not null default false,
   delivery_radius_km numeric,
+  timezone text not null default 'America/Toronto',
   created_at timestamptz not null default now()
+);
+
+-- Per-day operating hours. No rows at all = always open (backward-compatible
+-- default for every existing tenant); once an admin saves hours, all 7 days
+-- get a row (even if marked closed) so there's no ambiguous partial state.
+create table restaurant_hours (
+  id uuid primary key default gen_random_uuid(),
+  restaurant_id uuid not null references restaurants(id) on delete cascade,
+  day_of_week integer not null check (day_of_week between 0 and 6), -- 0=Sunday .. 6=Saturday
+  is_closed boolean not null default false,
+  open_time time,
+  close_time time,
+  unique (restaurant_id, day_of_week)
 );
 
 -- A physical location of a restaurant. Menu/pricing (tax_rate, delivery_fee_cents,
@@ -125,6 +139,7 @@ create table order_items (
 
 create index restaurant_admins_user_id_idx on restaurant_admins (user_id);
 create index restaurant_locations_restaurant_id_idx on restaurant_locations (restaurant_id);
+create index restaurant_hours_restaurant_id_idx on restaurant_hours (restaurant_id);
 create index menu_categories_restaurant_id_idx on menu_categories (restaurant_id);
 create index menu_items_restaurant_id_idx on menu_items (restaurant_id);
 create index orders_restaurant_id_created_at_idx on orders (restaurant_id, created_at desc);
@@ -138,6 +153,7 @@ create index order_items_order_id_idx on order_items (order_id);
 alter table platform_admins enable row level security;
 alter table restaurants enable row level security;
 alter table restaurant_locations enable row level security;
+alter table restaurant_hours enable row level security;
 alter table restaurant_admins enable row level security;
 alter table menu_categories enable row level security;
 alter table menu_items enable row level security;
@@ -170,6 +186,11 @@ create policy "restaurant admins update their own restaurant" on restaurants
 create policy "restaurant locations are publicly readable" on restaurant_locations
   for select using (true);
 create policy "restaurant admins manage their locations" on restaurant_locations
+  for all using (is_restaurant_admin(restaurant_id)) with check (is_restaurant_admin(restaurant_id));
+
+create policy "restaurant hours are publicly readable" on restaurant_hours
+  for select using (true);
+create policy "restaurant admins manage their hours" on restaurant_hours
   for all using (is_restaurant_admin(restaurant_id)) with check (is_restaurant_admin(restaurant_id));
 
 create policy "admins see their own restaurant_admins rows" on restaurant_admins

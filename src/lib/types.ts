@@ -15,7 +15,17 @@ export type Restaurant = {
   stripe_onboarding_complete: boolean;
   is_live: boolean;
   delivery_radius_km: number | null;
+  timezone: string;
   created_at: string;
+};
+
+export type RestaurantHours = {
+  id: string;
+  restaurant_id: string;
+  day_of_week: number; // 0=Sunday .. 6=Saturday
+  is_closed: boolean;
+  open_time: string | null; // "HH:MM:SS"
+  close_time: string | null;
 };
 
 export type RestaurantLocation = {

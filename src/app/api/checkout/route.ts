@@ -3,7 +3,8 @@ import { createClient } from "@/lib/supabase/server";
 import { stripe, STRIPE_FEE_PERCENT, STRIPE_FEE_FIXED_CENTS } from "@/lib/stripe";
 import { priceCart } from "@/lib/cart-pricing";
 import { haversineDistanceKm } from "@/lib/geo";
-import type { Restaurant, RestaurantLocation } from "@/lib/types";
+import { isRestaurantOpen } from "@/lib/hours";
+import type { Restaurant, RestaurantHours, RestaurantLocation } from "@/lib/types";
 
 function randomLetters(n: number) {
   const letters = "abcdefghijklmnopqrstuvwxyz";
@@ -56,6 +57,17 @@ export async function POST(request: NextRequest) {
   }
   if (!restaurant.stripe_account_id || !restaurant.stripe_onboarding_complete) {
     return NextResponse.json({ error: "This restaurant isn't accepting payments yet" }, { status: 400 });
+  }
+
+  // Re-checked here even though the checkout page itself already blocks when
+  // closed — a page loaded before closing time could still submit after.
+  const { data: hoursRows } = await supabase
+    .from("restaurant_hours")
+    .select("*")
+    .eq("restaurant_id", restaurant.id)
+    .returns<RestaurantHours[]>();
+  if (!isRestaurantOpen(hoursRows ?? [], restaurant.timezone)) {
+    return NextResponse.json({ error: `${restaurant.name} is currently closed.` }, { status: 400 });
   }
 
   // Multi-location gating: menu/pricing stay restaurant-wide regardless of
