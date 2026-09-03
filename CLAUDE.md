@@ -212,10 +212,25 @@ listener is ever stopped/restarted — they'll drift out of sync if you only upd
   Also shows a "Connect Stripe" banner/button when `stripe_onboarding_complete` is false.
 - `/admin/[slug]/connect/return` and `/admin/[slug]/connect/refresh` — Stripe's hosted-onboarding
   redirect targets (**built**, see Stripe Connect section above)
-- `/onboard` — new restaurant signup flow (creating the `restaurants` row + first admin user)
-  for acquiring new tenants — distinct from Stripe Connect onboarding, which is per-restaurant
-  and already built for existing restaurants (**not built**)
-- `/platform-admin` — cross-restaurant super-admin view (**not built**)
+- `/onboard` — **built**: new restaurant signup flow. `POST /api/onboard` (service-role client,
+  bypasses RLS) validates inputs, creates the Supabase Auth user, `restaurants` row, and
+  `restaurant_admins` link (role `owner`) — best-effort cleanup on partial failure since it's not
+  a real DB transaction. Client form (`src/app/onboard/page.tsx`) auto-slugifies the restaurant
+  name, then signs the new user in and redirects to `/admin/[slug]`. Verified end-to-end via
+  browser (signup → auto sign-in → redirect → empty dashboard with "Stripe isn't connected yet").
+- `/admin/[slug]/menu` — **built**: menu management for restaurant admins. Server Actions
+  (`src/app/admin/[slug]/menu/actions.ts`) for add/edit/delete category, add/edit/delete item,
+  toggle availability — all authorized via existing RLS policies (session-scoped client, no
+  service-role bypass needed). New categories default to a low/null `sort_order` so they render
+  **first**, not last — not a bug, just worth knowing before assuming an add failed silently.
+  Verified end-to-end via browser + DB checks.
+- `/platform-admin` and `/platform-admin/login` — **built**: cross-restaurant super-admin view.
+  `requirePlatformAdmin()` (`src/lib/platform-admin.ts`) gates the page; RLS's
+  `is_platform_admin()` (used inside `is_restaurant_admin()`) is what actually grants the
+  session cross-tenant read access, the page guard is just the UX layer on top. Lists every
+  restaurant with Stripe connection status, order count, and revenue (aggregated client-side
+  from a single cross-tenant `orders` query), plus a Dashboard link into each restaurant's
+  `/admin/[slug]`. Verified end-to-end via browser + DB checks.
 
 ## Local dev
 
@@ -247,8 +262,18 @@ listener is ever stopped/restarted — they'll drift out of sync if you only upd
 
 ## Not built yet (in rough priority order)
 
-1. Restaurant onboarding flow (`/onboard`) — new tenant signup, distinct from Stripe
-   Connect onboarding (already built, per-restaurant)
-2. Menu management UI for restaurant admins
-3. Platform-admin cross-restaurant view
+1. **Deployment** — still local-only (`npm run dev`); Vercel deploy, production env vars, and
+   real Stripe Event Destinations (v1 + v2 thin) pointed at the deployed URL instead of
+   `stripe listen` are all outstanding.
+2. **Restaurant settings UI** — `tax_rate`, `delivery_fee_cents`, `free_delivery_threshold_cents`,
+   currency, etc. exist as DB columns (read by checkout/menu pages) but have no admin UI; only
+   editable by hand via SQL/seed today.
+3. **Auth completeness** — no password reset flow, no way to invite a second admin to an existing
+   restaurant (`restaurant_admins` supports multiple rows, but only onboarding's initial owner
+   insert exists), no rate limiting/abuse protection on the public `/onboard` signup endpoint.
+4. **Order lifecycle beyond "paid"** — no refund/cancellation handling, no customer-facing order
+   status notifications (email/SMS) when status changes.
+5. **Branding/customization per tenant** — no logo/image upload for restaurants or menu items
+   (emoji only today), no custom domain support.
+6. Automated tests — none yet (all verification so far has been manual/live browser + DB checks).
 
