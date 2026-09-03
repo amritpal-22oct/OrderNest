@@ -2,6 +2,7 @@ import Link from "next/link";
 import { requireRestaurantAdmin } from "@/lib/restaurant";
 import { money } from "@/lib/format";
 import type { MenuCategory, MenuItem } from "@/lib/types";
+import { ImageUploadField } from "./ImageUploadField";
 import {
   addCategoryAction,
   addItemAction,
@@ -46,6 +47,9 @@ export default async function MenuManagementPage({ params }: { params: Promise<{
             <Link href={`/admin/${slug}/hours`} className="text-sm text-neutral-500 hover:text-neutral-900">
               Hours
             </Link>
+            <Link href={`/admin/${slug}/promo`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Promo codes
+            </Link>
             <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
               ← Orders
             </Link>
@@ -72,7 +76,7 @@ export default async function MenuManagementPage({ params }: { params: Promise<{
 
             <ul className="mt-4 space-y-2">
               {(itemsByCategory.get(category.id) ?? []).map((item) => (
-                <ItemRow key={item.id} item={item} slug={slug} currency={restaurant.currency} categories={categories ?? []} />
+                <ItemRow key={item.id} item={item} slug={slug} restaurantId={restaurant.id} currency={restaurant.currency} categories={categories ?? []} />
               ))}
             </ul>
 
@@ -82,7 +86,7 @@ export default async function MenuManagementPage({ params }: { params: Promise<{
                 <input type="hidden" name="slug" value={slug} />
                 <input type="hidden" name="restaurantId" value={restaurant.id} />
                 <input type="hidden" name="categoryId" value={category.id} />
-                <ItemFields />
+                <ItemFields restaurantId={restaurant.id} />
                 <button type="submit" className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm text-white hover:bg-neutral-800">
                   Add item
                 </button>
@@ -96,7 +100,7 @@ export default async function MenuManagementPage({ params }: { params: Promise<{
             <h2 className="text-base font-semibold text-neutral-900">Uncategorized</h2>
             <ul className="mt-4 space-y-2">
               {uncategorized.map((item) => (
-                <ItemRow key={item.id} item={item} slug={slug} currency={restaurant.currency} categories={categories ?? []} />
+                <ItemRow key={item.id} item={item} slug={slug} restaurantId={restaurant.id} currency={restaurant.currency} categories={categories ?? []} />
               ))}
             </ul>
           </section>
@@ -129,7 +133,7 @@ export default async function MenuManagementPage({ params }: { params: Promise<{
   );
 }
 
-function ItemFields({ item }: { item?: MenuItem }) {
+function ItemFields({ item, restaurantId }: { item?: MenuItem; restaurantId: string }) {
   return (
     <div className="grid grid-cols-2 gap-2">
       <input name="name" required defaultValue={item?.name} placeholder="Name" className="col-span-2 rounded-md border border-neutral-300 px-2 py-1.5 text-sm" />
@@ -138,6 +142,7 @@ function ItemFields({ item }: { item?: MenuItem }) {
       <input name="emoji" defaultValue={item?.emoji ?? ""} placeholder="Emoji" maxLength={4} className="rounded-md border border-neutral-300 px-2 py-1.5 text-sm" />
       <input name="unit" defaultValue={item?.unit ?? ""} placeholder="Unit (e.g. 1 kg, 1 pc)" className="rounded-md border border-neutral-300 px-2 py-1.5 text-sm" />
       <input name="tags" defaultValue={item?.tags?.join(", ") ?? ""} placeholder="Tags (comma separated)" className="rounded-md border border-neutral-300 px-2 py-1.5 text-sm" />
+      <ImageUploadField restaurantId={restaurantId} defaultValue={item?.image_url} />
     </div>
   );
 }
@@ -145,11 +150,13 @@ function ItemFields({ item }: { item?: MenuItem }) {
 function ItemRow({
   item,
   slug,
+  restaurantId,
   currency,
   categories,
 }: {
   item: MenuItem;
   slug: string;
+  restaurantId: string;
   currency: string;
   categories: MenuCategory[];
 }) {
@@ -185,7 +192,7 @@ function ItemRow({
         <form action={updateItemAction} className="mt-2 space-y-2">
           <input type="hidden" name="slug" value={slug} />
           <input type="hidden" name="itemId" value={item.id} />
-          <ItemFields item={item} />
+          <ItemFields item={item} restaurantId={restaurantId} />
           <select name="categoryId" defaultValue={item.category_id ?? ""} className="w-full rounded-md border border-neutral-300 px-2 py-1.5 text-sm">
             <option value="">Uncategorized</option>
             {categories.map((c) => (

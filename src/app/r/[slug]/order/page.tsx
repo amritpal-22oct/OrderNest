@@ -1,7 +1,9 @@
 import { notFound } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import type { MenuCategory, MenuItem, RestaurantHours, RestaurantLocation } from "@/lib/types";
 import { formatTimeLabel, getTodayHours, isRestaurantOpen } from "@/lib/hours";
+import { getActivePromoCodes } from "@/lib/promo";
 import { RestaurantMenu } from "../RestaurantMenu";
 
 export default async function RestaurantOrderingPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -11,7 +13,7 @@ export default async function RestaurantOrderingPage({ params }: { params: Promi
   const { data: restaurant } = await supabase.from("restaurants").select("*").eq("slug", slug).maybeSingle();
   if (!restaurant) notFound();
 
-  const [{ data: categories }, { data: items }, { data: hours }, { data: locations }] = await Promise.all([
+  const [{ data: categories }, { data: items }, { data: hours }, { data: locations }, activePromos] = await Promise.all([
     supabase
       .from("menu_categories")
       .select("*")
@@ -34,6 +36,7 @@ export default async function RestaurantOrderingPage({ params }: { params: Promi
       .order("sort_order")
       .order("created_at")
       .returns<RestaurantLocation[]>(),
+    getActivePromoCodes(createAdminClient(), restaurant.id),
   ]);
 
   const open = isRestaurantOpen(hours ?? [], restaurant.timezone);
@@ -61,6 +64,7 @@ export default async function RestaurantOrderingPage({ params }: { params: Promi
       isOpen={open}
       hoursLabel={hoursLabel}
       locationSummary={locationSummary}
+      activePromos={activePromos}
     />
   );
 }

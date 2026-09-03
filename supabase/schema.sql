@@ -112,11 +112,14 @@ create table orders (
   customer_phone text not null,
   fulfillment_mode text not null check (fulfillment_mode in ('delivery', 'pickup')),
   delivery_address jsonb,
-  pickup_time text,
+  pickup_time text, -- human display label, now used for both fulfillment modes
+  scheduled_for timestamptz, -- null = ASAP
   location_id uuid references restaurant_locations(id) on delete set null,
   subtotal_cents integer not null,
   delivery_fee_cents integer not null default 0,
   tax_cents integer not null default 0,
+  promo_code text, -- plain snapshot, not an FK — survives the promo row being edited/deleted later
+  discount_cents integer not null default 0,
   total_cents integer not null,
   currency text not null default 'cad',
   status text not null default 'pending'
@@ -124,6 +127,24 @@ create table orders (
   stripe_checkout_session_id text,
   stripe_payment_intent_id text,
   created_at timestamptz not null default now()
+);
+
+-- Restaurant-scoped promo/coupon codes. Deliberately NO public select policy —
+-- the one table in this app that must not be scrapeable; customer-facing
+-- validation goes through a service-role route (src/lib/promo.ts) instead.
+create table promo_codes (
+  id uuid primary key default gen_random_uuid(),
+  restaurant_id uuid not null references restaurants(id) on delete cascade,
+  code text not null,
+  discount_type text not null check (discount_type in ('percent', 'fixed')),
+  discount_value integer not null check (discount_value > 0), -- percent: 1-100; fixed: cents
+  max_uses integer,
+  uses_count integer not null default 0,
+  expires_at timestamptz,
+  min_subtotal_cents integer not null default 0,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  unique (restaurant_id, code)
 );
 
 create table order_items (
@@ -140,6 +161,7 @@ create table order_items (
 create index restaurant_admins_user_id_idx on restaurant_admins (user_id);
 create index restaurant_locations_restaurant_id_idx on restaurant_locations (restaurant_id);
 create index restaurant_hours_restaurant_id_idx on restaurant_hours (restaurant_id);
+create index promo_codes_restaurant_id_idx on promo_codes (restaurant_id);
 create index menu_categories_restaurant_id_idx on menu_categories (restaurant_id);
 create index menu_items_restaurant_id_idx on menu_items (restaurant_id);
 create index orders_restaurant_id_created_at_idx on orders (restaurant_id, created_at desc);
@@ -154,6 +176,7 @@ alter table platform_admins enable row level security;
 alter table restaurants enable row level security;
 alter table restaurant_locations enable row level security;
 alter table restaurant_hours enable row level security;
+alter table promo_codes enable row level security;
 alter table restaurant_admins enable row level security;
 alter table menu_categories enable row level security;
 alter table menu_items enable row level security;
@@ -193,6 +216,12 @@ create policy "restaurant hours are publicly readable" on restaurant_hours
 create policy "restaurant admins manage their hours" on restaurant_hours
   for all using (is_restaurant_admin(restaurant_id)) with check (is_restaurant_admin(restaurant_id));
 
+-- No public select policy on purpose — promo codes must not be scrapeable by
+-- anonymous customers. Validation at checkout goes through a service-role
+-- route (src/lib/promo.ts), same sanctioned bypass /api/onboard already uses.
+create policy "restaurant admins manage their promo codes" on promo_codes
+  for all using (is_restaurant_admin(restaurant_id)) with check (is_restaurant_admin(restaurant_id));
+
 create policy "admins see their own restaurant_admins rows" on restaurant_admins
   for select using (user_id = auth.uid() or is_platform_admin());
 create policy "platform admins manage restaurant_admins" on restaurant_admins
@@ -219,3 +248,28 @@ create policy "restaurant admins read their order items" on order_items
   for select using (
     exists (select 1 from orders o where o.id = order_id and is_restaurant_admin(o.restaurant_id))
   );
+
+-- ---------- Storage: menu item images ----------
+-- Path convention: {restaurant_id}/{uuid}.{ext} — storage.foldername(name)[1]
+-- is the restaurant_id folder; reuses is_restaurant_admin(uuid) directly,
+-- same authorization primitive as every other table.
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('menu-item-images', 'menu-item-images', true, 5242880, array['image/jpeg','image/png','image/webp'])
+on conflict (id) do nothing;
+
+create policy "menu item images are publicly readable"
+on storage.objects for select using (bucket_id = 'menu-item-images');
+
+create policy "restaurant admins upload their own menu item images"
+on storage.objects for insert to authenticated
+with check (bucket_id = 'menu-item-images' and is_restaurant_admin((storage.foldername(name))[1]::uuid));
+
+create policy "restaurant admins update their own menu item images"
+on storage.objects for update to authenticated
+using (bucket_id = 'menu-item-images' and is_restaurant_admin((storage.foldername(name))[1]::uuid))
+with check (bucket_id = 'menu-item-images' and is_restaurant_admin((storage.foldername(name))[1]::uuid));
+
+create policy "restaurant admins delete their own menu item images"
+on storage.objects for delete to authenticated
+using (bucket_id = 'menu-item-images' and is_restaurant_admin((storage.foldername(name))[1]::uuid));

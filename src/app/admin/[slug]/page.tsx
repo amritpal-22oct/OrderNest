@@ -105,6 +105,9 @@ export default async function AdminOrdersPage({
             <Link href={`/admin/${slug}/hours`} className="text-sm text-neutral-500 hover:text-neutral-900">
               Hours
             </Link>
+            <Link href={`/admin/${slug}/promo`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Promo codes
+            </Link>
             <form action={signOutAction}>
               <input type="hidden" name="slug" value={slug} />
               <button type="submit" className="text-sm text-neutral-500 hover:text-neutral-900">
@@ -210,9 +213,15 @@ export default async function AdminOrdersPage({
                     <p className="text-neutral-700">
                       {order.fulfillment_mode === "delivery"
                         ? `Delivering to: ${order.delivery_address?.address1 ?? ""}, ${order.delivery_address?.city ?? ""}`
-                        : `Pickup: ${order.pickup_time ?? ""}`}
+                        : `Pickup`}
+                      {order.pickup_time && <span className="text-neutral-400"> · {order.pickup_time}</span>}
                       {order.location?.name && <span className="text-neutral-400"> · {order.location.name}</span>}
                     </p>
+                    {(order.promo_code || order.discount_cents > 0) && (
+                      <p className="mt-1 text-xs text-green-700">
+                        Promo {order.promo_code} applied · −{money(order.discount_cents, order.currency)}
+                      </p>
+                    )}
                     <ul className="mt-2 space-y-1 text-neutral-600">
                       {order.order_items?.map((item) => (
                         <li key={item.id} className="flex justify-between">

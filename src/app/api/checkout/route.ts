@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { stripe, STRIPE_FEE_PERCENT, STRIPE_FEE_FIXED_CENTS } from "@/lib/stripe";
 import { priceCart } from "@/lib/cart-pricing";
 import { haversineDistanceKm } from "@/lib/geo";
 import { isRestaurantOpen } from "@/lib/hours";
+import { isValidScheduledTime } from "@/lib/scheduling";
+import { validatePromoCode } from "@/lib/promo";
 import type { Restaurant, RestaurantHours, RestaurantLocation } from "@/lib/types";
 
 function randomLetters(n: number) {
@@ -19,6 +22,9 @@ export async function POST(request: NextRequest) {
     customer?: { name?: string; email?: string; phone?: string };
     delivery?: { address1?: string; city?: string; province?: string; postal?: string; instructions?: string } | null;
     pickupTime?: string | null;
+    scheduledFor?: string | null;
+    timeLabel?: string | null;
+    promoCode?: string | null;
     locationId?: string | null;
     customerLat?: number | null;
     customerLng?: number | null;
@@ -30,7 +36,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
 
-  const { slug, cart, fulfillmentMode, customer, delivery, pickupTime, locationId, customerLat, customerLng } = body;
+  const { slug, cart, fulfillmentMode, customer, delivery, scheduledFor, timeLabel, promoCode, locationId, customerLat, customerLng } = body;
 
   if (!slug || !cart || Object.keys(cart).length === 0) {
     return NextResponse.json({ error: "Cart is empty" }, { status: 400 });
@@ -68,6 +74,21 @@ export async function POST(request: NextRequest) {
     .returns<RestaurantHours[]>();
   if (!isRestaurantOpen(hoursRows ?? [], restaurant.timezone)) {
     return NextResponse.json({ error: `${restaurant.name} is currently closed.` }, { status: 400 });
+  }
+
+  let scheduledForDate: Date | null = null;
+  if (scheduledFor) {
+    scheduledForDate = new Date(scheduledFor);
+    if (Number.isNaN(scheduledForDate.getTime())) {
+      return NextResponse.json({ error: "Invalid scheduled time" }, { status: 400 });
+    }
+    const check = isValidScheduledTime(hoursRows ?? [], restaurant.timezone, scheduledForDate);
+    if (!check.ok) {
+      return NextResponse.json(
+        { error: check.reason === "past" ? "That time has already passed." : `${restaurant.name} is closed at that time.` },
+        { status: 400 }
+      );
+    }
   }
 
   // Multi-location gating: menu/pricing stay restaurant-wide regardless of
@@ -118,9 +139,33 @@ export async function POST(request: NextRequest) {
   }
 
   const priced = await priceCart(restaurant, cart, fulfillmentMode);
+  if (priced.unavailableNames.length > 0) {
+    return NextResponse.json(
+      { error: `No longer available: ${priced.unavailableNames.join(", ")}. Please remove from your cart and try again.` },
+      { status: 400 },
+    );
+  }
   if (priced.lines.length === 0) {
     return NextResponse.json({ error: "No valid items in cart" }, { status: 400 });
   }
+
+  // Never trusted from the client — re-validated here against the promo's
+  // own rules, same "server re-derives everything" pattern as pricing/radius/hours.
+  let discountCents = 0;
+  let appliedPromoCode: string | null = null;
+  if (promoCode) {
+    const adminForPromo = createAdminClient();
+    const result = await validatePromoCode(adminForPromo, restaurant.id, promoCode, priced.subtotalCents);
+    if (!result.ok) {
+      return NextResponse.json({ error: result.error }, { status: 400 });
+    }
+    discountCents = result.discountCents;
+    appliedPromoCode = result.promo.code;
+  }
+
+  const discountedSubtotalCents = priced.subtotalCents - discountCents;
+  const taxCents = Math.round((discountedSubtotalCents + priced.deliveryFeeCents) * Number(restaurant.tax_rate));
+  const totalCents = discountedSubtotalCents + priced.deliveryFeeCents + taxCents;
 
   const line_items = priced.lines.map((line) => ({
     quantity: line.quantity,
@@ -137,24 +182,50 @@ export async function POST(request: NextRequest) {
       price_data: { currency: restaurant.currency, unit_amount: priced.deliveryFeeCents, product_data: { name: "Delivery Fee" } },
     });
   }
-  if (priced.taxCents > 0) {
+  if (taxCents > 0) {
     line_items.push({
       quantity: 1,
-      price_data: { currency: restaurant.currency, unit_amount: priced.taxCents, product_data: { name: "Tax" } },
+      price_data: { currency: restaurant.currency, unit_amount: taxCents, product_data: { name: "Tax" } },
     });
   }
 
-  // Pass-through only, not platform revenue — see src/lib/stripe.ts. Nets to
-  // ~$0 for the platform; the restaurant's payout absorbs Stripe's own fee,
-  // same as if they'd connected to Stripe directly.
-  const stripeFeePassThroughCents = Math.round(priced.totalCents * STRIPE_FEE_PERCENT) + STRIPE_FEE_FIXED_CENTS;
+  // Session-level discount, not a negative line item (Stripe forbids negative
+  // unit_amount). Always amount_off, even for percent-type promos — the
+  // percent math already happened authoritatively against our own
+  // subtotalCents; handing Stripe a raw percent_off would have it re-derive
+  // against the full line-item sum (including Delivery/Tax), which isn't
+  // what was computed.
+  let discounts: { coupon: string }[] | undefined;
+  if (discountCents > 0) {
+    const coupon = await stripe.coupons.create({
+      amount_off: discountCents,
+      currency: restaurant.currency,
+      duration: "once",
+    });
+    discounts = [{ coupon: coupon.id }];
+  }
+
+  // Pass-through only, not platform revenue — see src/lib/stripe.ts. Computed
+  // off the post-discount total (totalCents), per the zero-revenue
+  // pass-through model — the platform never profits from a promo discount.
+  const stripeFeePassThroughCents = Math.round(totalCents * STRIPE_FEE_PERCENT) + STRIPE_FEE_FIXED_CENTS;
   const origin = request.headers.get("origin") ?? new URL(request.url).origin;
 
   try {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      ui_mode: "embedded_page",
+      // ui_mode: "elements" (Custom Checkout) — the client mounts just the
+      // Payment Element inline inside CheckoutForm.tsx's own layout via
+      // stripe.initCheckoutElementsSdk(), instead of "embedded_page"'s
+      // distinct Stripe-branded full-width takeover. Same client_secret
+      // contract either way. https://docs.stripe.com/payments/quickstart
+      ui_mode: "elements",
+      // Card only — Apple Pay/Google Pay surface automatically as wallets
+      // within the card payment method for eligible browsers/devices, no
+      // separate PMT entry needed. Klarna/Affirm/Link intentionally excluded.
+      payment_method_types: ["card"],
       line_items,
+      discounts,
       customer_email: customer.email,
       return_url: `${origin}/r/${slug}/success?session_id={CHECKOUT_SESSION_ID}`,
       integration_identifier: `ordernest-checkout-${randomLetters(8)}`,
@@ -167,9 +238,15 @@ export async function POST(request: NextRequest) {
         fulfillment_mode: fulfillmentMode,
         customer_name: customer.name,
         customer_phone: customer.phone,
-        pickup_time: pickupTime || "",
+        pickup_time: timeLabel || "",
+        scheduled_for: scheduledForDate?.toISOString() ?? "",
         delivery_address: fulfillmentMode === "delivery" ? JSON.stringify(delivery) : "",
         location_id: resolvedLocation?.id ?? "",
+        promo_code: appliedPromoCode ?? "",
+        discount_cents: String(discountCents),
+        subtotal_cents: String(priced.subtotalCents),
+        delivery_fee_cents: String(priced.deliveryFeeCents),
+        tax_cents: String(taxCents),
       },
     });
 

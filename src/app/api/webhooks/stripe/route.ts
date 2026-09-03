@@ -57,9 +57,15 @@ async function fulfillOrder(sessionId: string) {
   const taxLine = lines.find((li) => li.description === "Tax");
   const itemLines = lines.filter((li) => li !== deliveryLine && li !== taxLine);
 
-  const subtotalCents = itemLines.reduce((sum, li) => sum + (li.amount_total ?? 0), 0);
-  const deliveryFeeCents = deliveryLine?.amount_total ?? 0;
-  const taxCents = taxLine?.amount_total ?? 0;
+  // Once any session-level discount exists, Stripe proportionally distributes
+  // it across every line item, so summing li.amount_total per bucket would be
+  // wrong. subtotal/delivery/tax are instead read straight from the metadata
+  // computed authoritatively at session-creation time (src/app/api/checkout).
+  const subtotalCents = Number(meta.subtotal_cents ?? 0);
+  const deliveryFeeCents = Number(meta.delivery_fee_cents ?? 0);
+  const taxCents = Number(meta.tax_cents ?? 0);
+  const discountCents = Number(meta.discount_cents ?? 0);
+  const promoCode = meta.promo_code || null;
 
   const paymentIntent = typeof session.payment_intent === "object" ? session.payment_intent : null;
 
@@ -73,10 +79,13 @@ async function fulfillOrder(sessionId: string) {
       fulfillment_mode: meta.fulfillment_mode ?? "pickup",
       delivery_address: meta.delivery_address ? JSON.parse(meta.delivery_address) : null,
       pickup_time: meta.pickup_time || null,
+      scheduled_for: meta.scheduled_for || null,
       location_id: meta.location_id || null,
       subtotal_cents: subtotalCents,
       delivery_fee_cents: deliveryFeeCents,
       tax_cents: taxCents,
+      promo_code: promoCode,
+      discount_cents: discountCents,
       total_cents: session.amount_total ?? 0,
       currency: session.currency ?? "cad",
       status: "paid",
@@ -91,15 +100,32 @@ async function fulfillOrder(sessionId: string) {
     return;
   }
 
+  // Snapshot each item's price from amount_subtotal (pre-discount, per-line)
+  // rather than amount_total — correct whether or not a promo was applied,
+  // since amount_total would otherwise carry a fraction of the discount.
   const orderItems = itemLines.map((li) => ({
     order_id: order.id,
     name_snapshot: li.description ?? "Item",
-    price_cents_snapshot: li.quantity ? Math.round((li.amount_total ?? 0) / li.quantity) : (li.amount_total ?? 0),
+    price_cents_snapshot: li.quantity ? Math.round((li.amount_subtotal ?? 0) / li.quantity) : (li.amount_subtotal ?? 0),
     quantity: li.quantity ?? 1,
   }));
 
   if (orderItems.length > 0) {
     const { error: itemsError } = await supabase.from("order_items").insert(orderItems);
     if (itemsError) console.error("Webhook: failed to insert order_items", sessionId, itemsError);
+  }
+
+  // Webhook-time only, never at session-creation — an abandoned checkout must
+  // not count against the code's usage limit.
+  if (promoCode) {
+    const { data: promo } = await supabase
+      .from("promo_codes")
+      .select("id, uses_count")
+      .eq("restaurant_id", restaurantId)
+      .eq("code", promoCode)
+      .maybeSingle();
+    if (promo) {
+      await supabase.from("promo_codes").update({ uses_count: promo.uses_count + 1 }).eq("id", promo.id);
+    }
   }
 }

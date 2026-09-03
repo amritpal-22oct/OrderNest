@@ -33,6 +33,9 @@ export default async function HoursManagementPage({ params }: { params: Promise<
             <Link href={`/admin/${slug}/locations`} className="text-sm text-neutral-500 hover:text-neutral-900">
               Locations
             </Link>
+            <Link href={`/admin/${slug}/promo`} className="text-sm text-neutral-500 hover:text-neutral-900">
+              Promo codes
+            </Link>
             <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
               ← Orders
             </Link>

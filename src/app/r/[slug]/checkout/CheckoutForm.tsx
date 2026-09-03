@@ -3,16 +3,33 @@
 import { useEffect, useMemo, useState } from "react";
 import Script from "next/script";
 import Link from "next/link";
-import type { MenuItem, Restaurant, RestaurantLocation } from "@/lib/types";
+import type { MenuItem, Restaurant, RestaurantHours, RestaurantLocation } from "@/lib/types";
 import { money } from "@/lib/format";
+import { getSchedulingAvailability } from "@/lib/scheduling";
 import { LocationPicker, clearStoredLocation, loadStoredLocation, type ResolvedLocation } from "./LocationPicker";
 
-type EmbeddedCheckout = { mount: (selector: string) => void };
+// Custom Checkout (ui_mode: "elements") — the Payment Element mounts inline
+// within our own page/layout, unlike initEmbeddedCheckout's ui_mode:
+// "embedded_page", which renders as a distinct Stripe-branded full-width
+// card. https://docs.stripe.com/payments/quickstart
+//
+// initCheckout is synchronous as of the "Clover" Stripe.js release (loaded
+// below via the versioned script URL, not the generic v3 build, which
+// doesn't have this method at all) — confirmed against Stripe's own
+// changelog rather than assumed, since this API has changed shape across
+// releases (was async initCheckoutElementsSdk pre-Clover).
+type StripeElement = { mount: (selector: string) => void; unmount: () => void };
+type CheckoutConfirmResult = { error?: { message?: string } } | undefined;
+type LoadActionsResult = { type: "success"; actions: { confirm: () => Promise<CheckoutConfirmResult> } } | { type: "error"; error?: { message?: string } };
+type StripeCheckout = {
+  createPaymentElement: () => StripeElement;
+  loadActions: () => Promise<LoadActionsResult>;
+};
 
 declare global {
   interface Window {
     Stripe?: (key: string) => {
-      initEmbeddedCheckout: (opts: { clientSecret: string }) => Promise<EmbeddedCheckout>;
+      initCheckout: (opts: { clientSecret: string }) => StripeCheckout;
     };
   }
 }
@@ -32,10 +49,12 @@ export function CheckoutForm({
   restaurant,
   items,
   locations,
+  hours,
 }: {
   restaurant: Restaurant;
   items: MenuItem[];
   locations: RestaurantLocation[];
+  hours: RestaurantHours[];
 }) {
   const [cart, setCart] = useState<Cart>({});
   const [hydrated, setHydrated] = useState(false);
@@ -43,7 +62,12 @@ export function CheckoutForm({
   const [fulfillmentMode, setFulfillmentMode] = useState<"delivery" | "pickup">("delivery");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pendingCheckout, setPendingCheckout] = useState<EmbeddedCheckout | null>(null);
+  // Set once the Checkout Session exists and the Payment Element is mounted
+  // — the rest of the form (order summary, contact details, etc.) stays
+  // visible and disabled rather than being replaced, so payment reads as a
+  // continuation of the same page instead of a separate step.
+  const [checkout, setCheckout] = useState<StripeCheckout | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   // Fewer than 2 locations: skip the picker entirely, exactly today's behavior
   // (no radius check, both fulfillment modes always available).
@@ -70,28 +94,66 @@ export function CheckoutForm({
     else if (fulfillmentMode === "pickup" && !pickupAllowed && deliveryAllowed) setFulfillmentMode("delivery");
   }, [deliveryAllowed, pickupAllowed, fulfillmentMode]);
 
-  const [name, setName] = useState("");
-  const [phone, setPhone] = useState("");
-  const [email, setEmail] = useState("");
-  const [address1, setAddress1] = useState("");
-  const [city, setCity] = useState("");
-  const [province, setProvince] = useState("");
-  const [postal, setPostal] = useState("");
+  // TEMP dev convenience (requested this session): prefilled with static
+  // test data so manual checkout runs don't need retyping every time.
+  // Revert to empty strings before this goes anywhere near real customers.
+  const [name, setName] = useState("Test Customer");
+  const [phone, setPhone] = useState("9055551234");
+  const [email, setEmail] = useState("test.customer@example.com");
+  const [address1, setAddress1] = useState("123 Test Street");
+  const [city, setCity] = useState("Brampton");
+  const [province, setProvince] = useState("ON");
+  const [postal, setPostal] = useState("L6T 0A1");
   const [instructions, setInstructions] = useState("");
-  const [pickupTime, setPickupTime] = useState("As soon as possible");
 
-  useEffect(() => {
-    setCart(loadCart(restaurant.slug));
-    setHydrated(true);
-  }, [restaurant.slug]);
+  const availability = useMemo(() => getSchedulingAvailability(hours, restaurant.timezone), [hours, restaurant.timezone]);
+  const [scheduleMode, setScheduleMode] = useState<"asap" | "schedule">("asap");
+  const [selectedDate, setSelectedDate] = useState(availability.mode === "slots" ? (availability.days[0]?.date ?? "") : "");
+  const [selectedSlotValue, setSelectedSlotValue] = useState(
+    availability.mode === "slots" ? (availability.days[0]?.slots[0]?.value ?? "") : ""
+  );
+  const [datetimeLocal, setDatetimeLocal] = useState("");
 
-  useEffect(() => {
-    if (pendingCheckout) pendingCheckout.mount("#checkout-container");
-  }, [pendingCheckout]);
+  const selectedDay = availability.mode === "slots" ? availability.days.find((d) => d.date === selectedDate) : undefined;
+
+  const [promoCodeInput, setPromoCodeInput] = useState("");
+  const [appliedPromo, setAppliedPromo] = useState<{ code: string; discountCents: number } | null>(null);
+  const [promoStatus, setPromoStatus] = useState<{ loading: boolean; error: string | null }>({ loading: false, error: null });
 
   const itemsById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
 
-  const { subtotalCents, deliveryFeeCents, taxCents, totalCents, count } = useMemo(() => {
+  const [removedItemNames, setRemovedItemNames] = useState<string[]>([]);
+
+  // A cart persisted in localStorage can outlive the menu — an item an admin
+  // marked unavailable stays in a returning customer's cart otherwise, and
+  // would get silently dropped from the total right at payment time
+  // (priceCart does the same server-side, but the customer should find out
+  // here, not get a smaller total as a surprise). Strip + tell them upfront.
+  useEffect(() => {
+    const loaded = loadCart(restaurant.slug);
+    const removedNames: string[] = [];
+    const stripped: Cart = {};
+    for (const [id, qty] of Object.entries(loaded)) {
+      const item = itemsById.get(id);
+      if (item && !item.is_available) {
+        removedNames.push(item.name);
+        continue;
+      }
+      stripped[id] = qty;
+    }
+    setCart(stripped);
+    if (removedNames.length > 0) {
+      setRemovedItemNames(removedNames);
+      window.localStorage.setItem(`ordernest_cart_${restaurant.slug}`, JSON.stringify(stripped));
+    }
+    setHydrated(true);
+  }, [restaurant.slug, itemsById]);
+
+  useEffect(() => {
+    if (checkout) checkout.createPaymentElement().mount("#payment-element");
+  }, [checkout]);
+
+  const { subtotalCents, deliveryFeeCents, discountCents, taxCents, totalCents, count } = useMemo(() => {
     let subtotal = 0;
     let count = 0;
     for (const [id, qty] of Object.entries(cart)) {
@@ -106,11 +168,62 @@ export function CheckoutForm({
       fulfillmentMode === "delivery" && (freeThreshold === null || subtotal < freeThreshold)
         ? restaurant.delivery_fee_cents
         : 0;
-    const tax = Math.round((subtotal + deliveryFee) * Number(restaurant.tax_rate));
-    return { subtotalCents: subtotal, deliveryFeeCents: deliveryFee, taxCents: tax, totalCents: subtotal + deliveryFee + tax, count };
-  }, [cart, itemsById, fulfillmentMode, restaurant]);
+    // Mirrors the server's post-discount formula exactly (never authoritative
+    // — /api/checkout recomputes this independently) so the preview matches
+    // what Stripe's mounted embedded Checkout will actually charge.
+    const discount = appliedPromo ? Math.min(appliedPromo.discountCents, subtotal) : 0;
+    const discountedSubtotal = subtotal - discount;
+    const tax = Math.round((discountedSubtotal + deliveryFee) * Number(restaurant.tax_rate));
+    return {
+      subtotalCents: subtotal,
+      deliveryFeeCents: deliveryFee,
+      discountCents: discount,
+      taxCents: tax,
+      totalCents: discountedSubtotal + deliveryFee + tax,
+      count,
+    };
+  }, [cart, itemsById, fulfillmentMode, restaurant, appliedPromo]);
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function applyPromoCode() {
+    const code = promoCodeInput.trim();
+    if (!code) return;
+    setPromoStatus({ loading: true, error: null });
+    try {
+      const res = await fetch("/api/promo/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug: restaurant.slug, code, subtotalCents }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setAppliedPromo(null);
+        setPromoStatus({ loading: false, error: data.error || "Invalid promo code" });
+        return;
+      }
+      setAppliedPromo({ code: code.toUpperCase(), discountCents: data.discountCents });
+      setPromoStatus({ loading: false, error: null });
+    } catch {
+      setAppliedPromo(null);
+      setPromoStatus({ loading: false, error: "Unable to apply code right now" });
+    }
+  }
+
+  // Resolves the ASAP/schedule UI state into what /api/checkout expects:
+  // scheduledFor (ISO instant or null) and timeLabel (human string, also
+  // stored on the order as pickup_time for both fulfillment modes now).
+  function resolveScheduling(): { scheduledFor: string | null; timeLabel: string } {
+    if (scheduleMode === "asap") return { scheduledFor: null, timeLabel: "As soon as possible" };
+    if (availability.mode === "unrestricted") {
+      if (!datetimeLocal) return { scheduledFor: null, timeLabel: "As soon as possible" };
+      const date = new Date(datetimeLocal);
+      return { scheduledFor: date.toISOString(), timeLabel: date.toLocaleString() };
+    }
+    const slot = selectedDay?.slots.find((s) => s.value === selectedSlotValue);
+    if (!selectedDay || !slot) return { scheduledFor: null, timeLabel: "As soon as possible" };
+    return { scheduledFor: slot.value, timeLabel: `${selectedDay.label}, ${slot.label}` };
+  }
+
+  async function handleContinueToPayment(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
 
@@ -122,6 +235,14 @@ export function CheckoutForm({
       if (postal.trim().length < 4) return setError("Please enter a valid postal code.");
     }
     if (!stripeLoaded || !window.Stripe) return setError("Payment is still loading — try again in a moment.");
+    if (scheduleMode === "schedule" && availability.mode === "unrestricted" && !datetimeLocal) {
+      return setError("Please choose a time.");
+    }
+    if (scheduleMode === "schedule" && availability.mode === "slots" && !selectedDay?.slots.some((s) => s.value === selectedSlotValue)) {
+      return setError("Please choose a time.");
+    }
+
+    const { scheduledFor, timeLabel } = resolveScheduling();
 
     setSubmitting(true);
     try {
@@ -137,7 +258,9 @@ export function CheckoutForm({
             fulfillmentMode === "delivery"
               ? { address1: address1.trim(), city: city.trim(), province: province.trim(), postal: postal.trim().toUpperCase(), instructions: instructions.trim() }
               : null,
-          pickupTime: fulfillmentMode === "pickup" ? pickupTime : null,
+          scheduledFor,
+          timeLabel,
+          promoCode: appliedPromo?.code ?? null,
           locationId: activeLocation?.id ?? null,
           customerLat: needsPicker ? (resolvedLocation?.lat ?? null) : null,
           customerLng: needsPicker ? (resolvedLocation?.lng ?? null) : null,
@@ -147,14 +270,39 @@ export function CheckoutForm({
       if (!res.ok) throw new Error(data.error || "Unable to start checkout");
 
       const stripe = window.Stripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY!);
-      const embeddedCheckout = await stripe.initEmbeddedCheckout({ clientSecret: data.clientSecret });
-      // Store the instance; the effect below mounts it once React has actually
-      // committed the #checkout-container div (a raw setTimeout(0) isn't a
-      // strong enough guarantee — DOM commit can still lag behind it).
-      setPendingCheckout(embeddedCheckout);
+      const checkoutInstance = stripe.initCheckout({ clientSecret: data.clientSecret });
+      // Store the instance; the effect below mounts the Payment Element once
+      // React has actually committed the #payment-element div (a raw
+      // setTimeout(0) isn't a strong enough guarantee — DOM commit can still
+      // lag behind it).
+      setCheckout(checkoutInstance);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong. Please try again.");
+    } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function handleConfirmPayment() {
+    if (!checkout) return;
+    setError(null);
+    setConfirming(true);
+    try {
+      const loadActionsResult = await checkout.loadActions();
+      if (loadActionsResult.type === "error") {
+        setError(loadActionsResult.error?.message || "Payment failed. Please try again.");
+        setConfirming(false);
+        return;
+      }
+      const result = await loadActionsResult.actions.confirm();
+      if (result?.error) {
+        setError(result.error.message || "Payment failed. Please try again.");
+        setConfirming(false);
+      }
+      // On success Stripe redirects to return_url itself — nothing further to do here.
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Payment failed. Please try again.");
+      setConfirming(false);
     }
   }
 
@@ -165,6 +313,12 @@ export function CheckoutForm({
       <div className="flex min-h-screen items-center justify-center bg-neutral-50 px-4">
         <div className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 text-center shadow-sm">
           <h1 className="text-lg font-semibold text-neutral-900">Your cart is empty</h1>
+          {removedItemNames.length > 0 && (
+            <p className="mt-2 text-sm text-amber-700">
+              {removedItemNames.join(", ")} {removedItemNames.length === 1 ? "is" : "are"} no longer available and{" "}
+              {removedItemNames.length === 1 ? "was" : "were"} removed from your cart.
+            </p>
+          )}
           <Link href={`/r/${restaurant.slug}/order`} className="mt-4 inline-block text-sm font-medium text-neutral-900 underline">
             ← Back to menu
           </Link>
@@ -191,7 +345,9 @@ export function CheckoutForm({
 
   return (
     <div className="min-h-screen bg-neutral-50 pb-20">
-      <Script src="https://js.stripe.com/v3/" onLoad={() => setStripeLoaded(true)} />
+      {/* Versioned build required for initCheckout (Custom Checkout) — the
+          generic v3 evergreen build doesn't have this method at all. */}
+      <Script src="https://js.stripe.com/clover/stripe.js" onLoad={() => setStripeLoaded(true)} />
 
       <header className="border-b border-neutral-200 bg-white">
         <div className="mx-auto max-w-2xl px-6 py-5">
@@ -201,8 +357,17 @@ export function CheckoutForm({
       </header>
 
       <main className="mx-auto max-w-2xl px-6 py-8">
-        {!pendingCheckout ? (
-          <form onSubmit={handleSubmit} className="space-y-6">
+        <form onSubmit={handleContinueToPayment} className="space-y-6">
+          {/* Disabled (not hidden) once the payment step starts — the order
+              details stay visible and readable, but locked, so payment reads
+              as a continuation of this same page rather than a separate one. */}
+          <fieldset disabled={!!checkout} className="space-y-6 border-0 p-0 m-0 min-w-0 disabled:opacity-60">
+            {removedItemNames.length > 0 && (
+              <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                {removedItemNames.join(", ")} {removedItemNames.length === 1 ? "is" : "are"} no longer available and{" "}
+                {removedItemNames.length === 1 ? "was" : "were"} removed from your order.
+              </p>
+            )}
             <div className="rounded-xl border border-neutral-200 bg-white p-5">
               <h2 className="font-medium text-neutral-900">Delivery or pickup</h2>
 
@@ -251,7 +416,7 @@ export function CheckoutForm({
                 </p>
               )}
 
-              {fulfillmentMode === "delivery" ? (
+              {fulfillmentMode === "delivery" && (
                 <div className="mt-4 space-y-3">
                   <input placeholder="Street address" value={address1} onChange={(e) => setAddress1(e.target.value)} className="w-full rounded-md border border-neutral-300 px-3 py-2 text-sm" />
                   <div className="grid grid-cols-3 gap-3">
@@ -261,17 +426,62 @@ export function CheckoutForm({
                   </div>
                   <textarea placeholder="Delivery instructions (optional)" value={instructions} onChange={(e) => setInstructions(e.target.value)} rows={2} className="w-full rounded-md border border-neutral-300 px-3 py-2 text-sm" />
                 </div>
-              ) : (
-                <div className="mt-4">
-                  <label className="block text-sm text-neutral-600">Pickup time</label>
-                  <select value={pickupTime} onChange={(e) => setPickupTime(e.target.value)} className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm">
-                    <option>As soon as possible</option>
-                    <option>Today, 5:00 PM – 5:30 PM</option>
-                    <option>Today, 6:00 PM – 6:30 PM</option>
-                    <option>Tomorrow, 11:00 AM – 11:30 AM</option>
-                  </select>
-                </div>
               )}
+
+              <div className="mt-4">
+                <label className="block text-sm text-neutral-600">When</label>
+                <div className="mt-1 flex overflow-hidden rounded-full border border-neutral-200">
+                  {(["asap", "schedule"] as const).map((mode) => (
+                    <button
+                      type="button"
+                      key={mode}
+                      onClick={() => setScheduleMode(mode)}
+                      className={`flex-1 py-2 text-sm font-medium ${scheduleMode === mode ? "bg-neutral-900 text-white" : "text-neutral-600"}`}
+                    >
+                      {mode === "asap" ? "As soon as possible" : "Schedule for later"}
+                    </button>
+                  ))}
+                </div>
+
+                {scheduleMode === "schedule" &&
+                  (availability.mode === "unrestricted" ? (
+                    <input
+                      type="datetime-local"
+                      value={datetimeLocal}
+                      onChange={(e) => setDatetimeLocal(e.target.value)}
+                      className="mt-2 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm"
+                    />
+                  ) : (
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      <select
+                        value={selectedDate}
+                        onChange={(e) => {
+                          setSelectedDate(e.target.value);
+                          const day = availability.days.find((d) => d.date === e.target.value);
+                          setSelectedSlotValue(day?.slots[0]?.value ?? "");
+                        }}
+                        className="rounded-md border border-neutral-300 px-2 py-2 text-sm"
+                      >
+                        {availability.days.map((day) => (
+                          <option key={day.date} value={day.date}>
+                            {day.label}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={selectedSlotValue}
+                        onChange={(e) => setSelectedSlotValue(e.target.value)}
+                        className="rounded-md border border-neutral-300 px-2 py-2 text-sm"
+                      >
+                        {(selectedDay?.slots ?? []).map((slot) => (
+                          <option key={slot.value} value={slot.value}>
+                            {slot.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+              </div>
             </div>
 
             <div className="rounded-xl border border-neutral-200 bg-white p-5">
@@ -300,6 +510,12 @@ export function CheckoutForm({
                   <span>Subtotal</span>
                   <span>{money(subtotalCents, restaurant.currency)}</span>
                 </div>
+                {appliedPromo && (
+                  <div className="flex justify-between text-green-700">
+                    <span>Promo {appliedPromo.code}</span>
+                    <span>−{money(discountCents, restaurant.currency)}</span>
+                  </div>
+                )}
                 <div className="flex justify-between text-neutral-600">
                   <span>Delivery</span>
                   <span>{deliveryFeeCents === 0 ? "FREE" : money(deliveryFeeCents, restaurant.currency)}</span>
@@ -313,22 +529,73 @@ export function CheckoutForm({
                   <span>{money(totalCents, restaurant.currency)}</span>
                 </div>
               </div>
+
+              <div className="mt-3 border-t border-neutral-100 pt-3">
+                {appliedPromo ? (
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-green-700">Code {appliedPromo.code} applied</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAppliedPromo(null);
+                        setPromoCodeInput("");
+                        setPromoStatus({ loading: false, error: null });
+                      }}
+                      className="text-neutral-500 underline hover:text-neutral-900"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <input
+                      placeholder="Promo code"
+                      value={promoCodeInput}
+                      onChange={(e) => setPromoCodeInput(e.target.value)}
+                      className="flex-1 rounded-md border border-neutral-300 px-3 py-2 text-sm uppercase"
+                    />
+                    <button
+                      type="button"
+                      onClick={applyPromoCode}
+                      disabled={promoStatus.loading || !promoCodeInput.trim()}
+                      className="rounded-md border border-neutral-300 px-3 py-2 text-sm font-medium text-neutral-700 disabled:opacity-50"
+                    >
+                      {promoStatus.loading ? "Applying…" : "Apply"}
+                    </button>
+                  </div>
+                )}
+                {promoStatus.error && <p className="mt-1 text-xs text-red-600">{promoStatus.error}</p>}
+              </div>
             </div>
+          </fieldset>
 
-            {error && <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+          {error && <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
 
+          {!checkout ? (
             <button
               type="submit"
-              disabled={submitting}
+              disabled={submitting || !stripeLoaded}
               className="w-full rounded-full py-3 text-sm font-medium text-white disabled:opacity-50"
               style={{ backgroundColor: restaurant.brand_color }}
             >
-              {submitting ? "Preparing secure payment…" : `Pay ${money(totalCents, restaurant.currency)}`}
+              {submitting ? "Preparing secure payment…" : !stripeLoaded ? "Loading payment…" : "Continue to payment"}
             </button>
-          </form>
-        ) : (
-          <div id="checkout-container" />
-        )}
+          ) : (
+            <div className="rounded-xl border border-neutral-200 bg-white p-5">
+              <h2 className="font-medium text-neutral-900">Payment</h2>
+              <div id="payment-element" className="mt-3" />
+              <button
+                type="button"
+                onClick={handleConfirmPayment}
+                disabled={confirming}
+                className="mt-4 w-full rounded-full py-3 text-sm font-medium text-white disabled:opacity-50"
+                style={{ backgroundColor: restaurant.brand_color }}
+              >
+                {confirming ? "Processing…" : `Pay ${money(totalCents, restaurant.currency)}`}
+              </button>
+            </div>
+          )}
+        </form>
       </main>
     </div>
   );

@@ -70,6 +70,20 @@ export type MenuItem = {
   sort_order: number;
 };
 
+export type PromoCode = {
+  id: string;
+  restaurant_id: string;
+  code: string;
+  discount_type: "percent" | "fixed";
+  discount_value: number; // percent: 1-100; fixed: cents
+  max_uses: number | null;
+  uses_count: number;
+  expires_at: string | null;
+  min_subtotal_cents: number;
+  is_active: boolean;
+  created_at: string;
+};
+
 export type OrderStatus = "pending" | "paid" | "preparing" | "ready" | "completed" | "cancelled";
 
 export type OrderItem = {
@@ -90,10 +104,13 @@ export type Order = {
   fulfillment_mode: "delivery" | "pickup";
   delivery_address: Record<string, string> | null;
   pickup_time: string | null;
+  scheduled_for: string | null;
   location_id: string | null;
   subtotal_cents: number;
   delivery_fee_cents: number;
   tax_cents: number;
+  promo_code: string | null;
+  discount_cents: number;
   total_cents: number;
   currency: string;
   status: OrderStatus;

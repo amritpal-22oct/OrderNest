@@ -46,6 +46,7 @@ export async function addItemAction(formData: FormData) {
   const description = (formData.get("description") as string)?.trim() || null;
   const priceDollars = parseFloat(formData.get("price") as string);
   const emoji = (formData.get("emoji") as string)?.trim() || null;
+  const imageUrl = (formData.get("image_url") as string)?.trim() || null;
   const unit = (formData.get("unit") as string)?.trim() || null;
   const tags = parseTags(formData.get("tags"));
 
@@ -59,6 +60,7 @@ export async function addItemAction(formData: FormData) {
     description,
     price_cents: Math.round(priceDollars * 100),
     emoji,
+    image_url: imageUrl,
     unit,
     tags,
   });
@@ -72,6 +74,7 @@ export async function updateItemAction(formData: FormData) {
   const description = (formData.get("description") as string)?.trim() || null;
   const priceDollars = parseFloat(formData.get("price") as string);
   const emoji = (formData.get("emoji") as string)?.trim() || null;
+  const imageUrl = (formData.get("image_url") as string)?.trim() || null;
   const unit = (formData.get("unit") as string)?.trim() || null;
   const tags = parseTags(formData.get("tags"));
   const categoryId = (formData.get("categoryId") as string) || null;
@@ -86,6 +89,7 @@ export async function updateItemAction(formData: FormData) {
       description,
       price_cents: Math.round(priceDollars * 100),
       emoji,
+      image_url: imageUrl,
       unit,
       tags,
       category_id: categoryId,

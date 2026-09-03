@@ -63,5 +63,5 @@ export default async function CheckoutPage({ params }: { params: Promise<{ slug:
     .order("created_at")
     .returns<RestaurantLocation[]>();
 
-  return <CheckoutForm restaurant={restaurant} items={items ?? []} locations={locations ?? []} />;
+  return <CheckoutForm restaurant={restaurant} items={items ?? []} locations={locations ?? []} hours={hours ?? []} />;
 }

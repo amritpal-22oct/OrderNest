@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import type { MenuCategory, MenuItem, Restaurant } from "@/lib/types";
+import type { ActivePromoSummary } from "@/lib/promo";
 import { money } from "@/lib/format";
 
 type Cart = Record<string, number>;
@@ -27,6 +28,7 @@ export function RestaurantMenu({
   isOpen,
   hoursLabel,
   locationSummary,
+  activePromos,
 }: {
   restaurant: Restaurant;
   categories: MenuCategory[];
@@ -34,6 +36,7 @@ export function RestaurantMenu({
   isOpen: boolean;
   hoursLabel?: string | null;
   locationSummary?: string | null;
+  activePromos?: ActivePromoSummary[];
 }) {
   const [cart, setCart] = useState<Cart>({});
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -141,6 +144,20 @@ export function RestaurantMenu({
         </div>
       )}
 
+      {activePromos && activePromos.length > 0 && (
+        <div className="mx-auto max-w-4xl px-6 pt-6">
+          <div className="space-y-1 rounded-md bg-green-50 px-3 py-2 text-sm text-green-800">
+            {activePromos.map((promo) => (
+              <p key={promo.code}>
+                🎉 Use code <span className="font-mono font-semibold">{promo.code}</span> for{" "}
+                {promo.discount_type === "percent" ? `${promo.discount_value}% off` : `${money(promo.discount_value, restaurant.currency)} off`}
+                {promo.min_subtotal_cents > 0 ? ` orders over ${money(promo.min_subtotal_cents, restaurant.currency)}` : ""}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
       <main className="mx-auto max-w-4xl px-6 py-8">
         {categories.length > 0 && (
           <input
@@ -156,62 +173,98 @@ export function RestaurantMenu({
         ) : noSearchResults ? (
           <p className="text-sm text-neutral-500">No items match &quot;{search}&quot;.</p>
         ) : (
-          categories.map((category) => {
-            const categoryItems = itemsByCategory.get(category.id) ?? [];
-            if (categoryItems.length === 0) return null;
-            return (
-              <section key={category.id} className="mb-10">
-                <h2 className="mb-4 flex items-center gap-2 text-lg font-semibold text-neutral-900">
-                  {category.icon && <span>{category.icon}</span>}
-                  {category.title}
-                </h2>
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                  {categoryItems.map((item) => {
-                    const qty = cart[item.id] ?? 0;
+          <div className="flex items-start gap-8">
+            {/* Hidden while searching — simpler and more honest than keeping it
+                in sync with filtered-out categories. No scroll-spy active-state
+                yet (would need an IntersectionObserver), out of scope for now. */}
+            {!search.trim() && (
+              <aside className="hidden w-48 shrink-0 md:block">
+                <nav className="sticky top-6 space-y-1 text-sm">
+                  {categories.map((category) => {
+                    const categoryItems = itemsByCategory.get(category.id) ?? [];
+                    if (categoryItems.length === 0) return null;
                     return (
-                      <div key={item.id} className="flex items-start gap-3 rounded-xl border border-neutral-200 bg-white p-4">
-                        {item.emoji && <div className="text-3xl">{item.emoji}</div>}
-                        <div className="flex-1">
-                          <p className="font-medium text-neutral-900">{item.name}</p>
-                          {item.description && <p className="mt-0.5 text-sm text-neutral-500">{item.description}</p>}
-                          <div className="mt-2 flex items-center justify-between">
-                            <span className="text-sm font-medium text-neutral-700">
-                              {money(item.price_cents, restaurant.currency)}
-                              {item.unit && <span className="text-neutral-400"> · {item.unit}</span>}
-                            </span>
-                            {qty === 0 ? (
-                              <button
-                                onClick={() => addToCart(item.id, 1)}
-                                className="rounded-full border border-neutral-300 px-3 py-1 text-sm font-medium text-neutral-700 hover:border-neutral-400"
-                              >
-                                Add
-                              </button>
-                            ) : (
-                              <div className="flex items-center gap-2">
-                                <button
-                                  onClick={() => addToCart(item.id, -1)}
-                                  className="h-7 w-7 rounded-full border border-neutral-300 text-neutral-700 hover:border-neutral-400"
-                                >
-                                  −
-                                </button>
-                                <span className="w-4 text-center text-sm">{qty}</span>
-                                <button
-                                  onClick={() => addToCart(item.id, 1)}
-                                  className="h-7 w-7 rounded-full border border-neutral-300 text-neutral-700 hover:border-neutral-400"
-                                >
-                                  +
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
+                      <a
+                        key={category.id}
+                        href={`#cat-${category.id}`}
+                        className="flex items-center justify-between rounded-md px-2 py-1.5 text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900"
+                      >
+                        <span className="flex items-center gap-1.5 truncate">
+                          {category.icon && <span>{category.icon}</span>}
+                          {category.title}
+                        </span>
+                        <span className="text-xs text-neutral-400">{categoryItems.length}</span>
+                      </a>
                     );
                   })}
-                </div>
-              </section>
-            );
-          })
+                </nav>
+              </aside>
+            )}
+
+            <div className="min-w-0 flex-1">
+              {categories.map((category) => {
+                const categoryItems = itemsByCategory.get(category.id) ?? [];
+                if (categoryItems.length === 0) return null;
+                return (
+                  <section key={category.id} id={`cat-${category.id}`} className="mb-10 scroll-mt-24">
+                    <h2 className="mb-4 flex items-center gap-2 text-lg font-semibold text-neutral-900">
+                      {category.icon && <span>{category.icon}</span>}
+                      {category.title}
+                    </h2>
+                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                      {categoryItems.map((item) => {
+                        const qty = cart[item.id] ?? 0;
+                        return (
+                          <div key={item.id} className="flex items-start gap-3 rounded-xl border border-neutral-200 bg-white p-4">
+                            {item.image_url ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img src={item.image_url} alt={item.name} className="h-14 w-14 shrink-0 rounded-lg object-cover" />
+                            ) : (
+                              item.emoji && <div className="text-3xl">{item.emoji}</div>
+                            )}
+                            <div className="flex-1">
+                              <p className="font-medium text-neutral-900">{item.name}</p>
+                              {item.description && <p className="mt-0.5 text-sm text-neutral-500">{item.description}</p>}
+                              <div className="mt-2 flex items-center justify-between">
+                                <span className="text-sm font-medium text-neutral-700">
+                                  {money(item.price_cents, restaurant.currency)}
+                                  {item.unit && <span className="text-neutral-400"> · {item.unit}</span>}
+                                </span>
+                                {qty === 0 ? (
+                                  <button
+                                    onClick={() => addToCart(item.id, 1)}
+                                    className="rounded-full border border-neutral-300 px-3 py-1 text-sm font-medium text-neutral-700 hover:border-neutral-400"
+                                  >
+                                    Add
+                                  </button>
+                                ) : (
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      onClick={() => addToCart(item.id, -1)}
+                                      className="h-7 w-7 rounded-full border border-neutral-300 text-neutral-700 hover:border-neutral-400"
+                                    >
+                                      −
+                                    </button>
+                                    <span className="w-4 text-center text-sm">{qty}</span>
+                                    <button
+                                      onClick={() => addToCart(item.id, 1)}
+                                      className="h-7 w-7 rounded-full border border-neutral-300 text-neutral-700 hover:border-neutral-400"
+                                    >
+                                      +
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                );
+              })}
+            </div>
+          </div>
         )}
       </main>
 
