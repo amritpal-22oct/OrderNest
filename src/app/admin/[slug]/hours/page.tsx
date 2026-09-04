@@ -1,13 +1,13 @@
-import Link from "next/link";
 import { requireRestaurantAdmin } from "@/lib/restaurant";
 import type { RestaurantHours } from "@/lib/types";
+import { AdminHeader } from "../AdminHeader";
 import { saveHoursAction } from "./actions";
 
 const DAY_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 export default async function HoursManagementPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const { supabase, restaurant } = await requireRestaurantAdmin(slug);
+  const { supabase, restaurant, user, role } = await requireRestaurantAdmin(slug);
 
   const { data: hours } = await supabase
     .from("restaurant_hours")
@@ -20,28 +20,7 @@ export default async function HoursManagementPage({ params }: { params: Promise<
 
   return (
     <div className="min-h-screen bg-neutral-50">
-      <header className="border-b border-neutral-200 bg-white">
-        <div className="mx-auto flex max-w-2xl items-center justify-between px-6 py-4">
-          <div>
-            <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name}</h1>
-            <p className="text-sm text-neutral-500">Hours</p>
-          </div>
-          <div className="flex items-center gap-4">
-            <Link href={`/admin/${slug}/menu`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Menu
-            </Link>
-            <Link href={`/admin/${slug}/locations`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Locations
-            </Link>
-            <Link href={`/admin/${slug}/promo`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Promo codes
-            </Link>
-            <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              ← Orders
-            </Link>
-          </div>
-        </div>
-      </header>
+      <AdminHeader slug={slug} restaurant={restaurant} userEmail={user.email ?? ""} role={role} active="hours" />
 
       <main className="mx-auto max-w-2xl space-y-6 px-6 py-8">
         {!hasAnyHours && (

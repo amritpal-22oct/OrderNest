@@ -1,9 +1,10 @@
 import Link from "next/link";
 import { requirePlatformAdmin } from "@/lib/platform-admin";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { money } from "@/lib/format";
 import { stripe } from "@/lib/stripe";
 import type { Restaurant } from "@/lib/types";
-import { signOutAction, updateStripeCustomerIdAction, setUpPlatformBillingAction } from "./actions";
+import { signOutAction, updateStripeCustomerIdAction, setUpPlatformBillingAction, addRestaurantAdminAction } from "./actions";
 
 // Subscriptions are created/managed by hand in the Stripe Dashboard (no
 // in-app Checkout/webhook integration by design — see stripe_customer_id
@@ -33,16 +34,41 @@ async function lookupSubscriptionStatus(customerId: string): Promise<string> {
   }
 }
 
-export default async function PlatformAdminPage() {
+export default async function PlatformAdminPage({ searchParams }: { searchParams: Promise<{ adminError?: string }> }) {
   const { supabase, user } = await requirePlatformAdmin();
+  const { adminError } = await searchParams;
 
   // RLS grants a platform admin's session read access to every restaurant's
   // orders (is_restaurant_admin() short-circuits to true via is_platform_admin()),
   // so this genuinely returns orders across all tenants, not just one.
-  const [{ data: restaurants }, { data: orders }] = await Promise.all([
+  const [{ data: restaurants }, { data: orders }, { data: adminLinks }] = await Promise.all([
     supabase.from("restaurants").select("*").order("created_at", { ascending: false }).returns<Restaurant[]>(),
     supabase.from("orders").select("restaurant_id, total_cents, status"),
+    // Same RLS grant as above extends to restaurant_admins ("platform admins
+    // manage restaurant_admins"), so this is every restaurant's admin roster
+    // in one query rather than per-restaurant.
+    supabase.from("restaurant_admins").select("restaurant_id, user_id, role").returns<{ restaurant_id: string; user_id: string; role: string }[]>(),
   ]);
+
+  // restaurant_admins only has user_id — resolving to an email needs the
+  // service-role client (session client has no access to auth.users), same
+  // pattern as setUpPlatformBillingAction below. One lookup per distinct
+  // user, not per row, since the same person can admin multiple restaurants.
+  const adminClient = createAdminClient();
+  const distinctUserIds = [...new Set((adminLinks ?? []).map((a) => a.user_id))];
+  const emailByUserId = new Map<string, string>();
+  await Promise.all(
+    distinctUserIds.map(async (id) => {
+      const { data } = await adminClient.auth.admin.getUserById(id);
+      if (data.user?.email) emailByUserId.set(id, data.user.email);
+    }),
+  );
+  const adminsByRestaurant = new Map<string, { email: string; role: string }[]>();
+  for (const link of adminLinks ?? []) {
+    const list = adminsByRestaurant.get(link.restaurant_id) ?? [];
+    list.push({ email: emailByUserId.get(link.user_id) ?? link.user_id, role: link.role });
+    adminsByRestaurant.set(link.restaurant_id, list);
+  }
 
   const statsByRestaurant = new Map<string, { count: number; revenueCents: number }>();
   for (const order of orders ?? []) {
@@ -88,6 +114,13 @@ export default async function PlatformAdminPage() {
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-8">
+        {adminError && (
+          <div className="mb-6 rounded-xl border border-red-200 bg-red-50 px-5 py-4">
+            <p className="font-medium text-red-900">Couldn&apos;t add that admin</p>
+            <p className="text-sm text-red-700">{adminError}</p>
+          </div>
+        )}
+
         {!restaurants || restaurants.length === 0 ? (
           <p className="text-sm text-neutral-500">No restaurants yet.</p>
         ) : (
@@ -100,6 +133,7 @@ export default async function PlatformAdminPage() {
                   <th className="px-5 py-3 font-medium">Subscription</th>
                   <th className="px-5 py-3 font-medium">Orders</th>
                   <th className="px-5 py-3 font-medium">Revenue</th>
+                  <th className="px-5 py-3 font-medium">Admins</th>
                   <th className="px-5 py-3 font-medium"></th>
                 </tr>
               </thead>
@@ -158,6 +192,39 @@ export default async function PlatformAdminPage() {
                       </td>
                       <td className="px-5 py-3 text-neutral-700">{stats.count}</td>
                       <td className="px-5 py-3 text-neutral-700">{money(stats.revenueCents, restaurant.currency)}</td>
+                      <td className="px-5 py-3">
+                        <ul className="space-y-0.5">
+                          {(adminsByRestaurant.get(restaurant.id) ?? []).map((admin) => (
+                            <li key={admin.email} className="whitespace-nowrap text-neutral-700">
+                              {admin.email} <span className="text-xs text-neutral-400">({admin.role})</span>
+                            </li>
+                          ))}
+                        </ul>
+                        <form action={addRestaurantAdminAction} className="mt-1.5 flex flex-col gap-1">
+                          <input type="hidden" name="restaurantId" value={restaurant.id} />
+                          <input
+                            name="email"
+                            type="email"
+                            placeholder="email"
+                            className="w-36 rounded border border-neutral-300 px-1.5 py-0.5 text-xs text-neutral-700"
+                          />
+                          <input
+                            name="password"
+                            type="text"
+                            placeholder="password (set or reset)"
+                            className="w-36 rounded border border-neutral-300 px-1.5 py-0.5 text-xs text-neutral-700"
+                          />
+                          <div className="flex items-center gap-1">
+                            <select name="role" defaultValue="staff" className="rounded border border-neutral-300 px-1 py-0.5 text-xs text-neutral-700">
+                              <option value="owner">owner</option>
+                              <option value="staff">staff</option>
+                            </select>
+                            <button type="submit" className="rounded bg-neutral-100 px-2 py-0.5 text-xs text-neutral-600 hover:bg-neutral-200">
+                              Add
+                            </button>
+                          </div>
+                        </form>
+                      </td>
                       <td className="px-5 py-3 text-right">
                         <Link href={`/admin/${restaurant.slug}`} className="text-neutral-500 underline hover:text-neutral-900">
                           Dashboard

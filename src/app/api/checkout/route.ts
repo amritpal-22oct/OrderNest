@@ -7,7 +7,7 @@ import { haversineDistanceKm } from "@/lib/geo";
 import { isRestaurantOpen } from "@/lib/hours";
 import { isValidScheduledTime } from "@/lib/scheduling";
 import { validatePromoCode } from "@/lib/promo";
-import type { Restaurant, RestaurantHours, RestaurantLocation } from "@/lib/types";
+import type { Restaurant, RestaurantDeliveryAccount, RestaurantHours, RestaurantLocation } from "@/lib/types";
 
 function randomLetters(n: number) {
   const letters = "abcdefghijklmnopqrstuvwxyz";
@@ -155,7 +155,31 @@ export async function POST(request: NextRequest) {
     resolvedLocation = locations[0];
   }
 
-  const priced = await priceCart(restaurant, cart, fulfillmentMode);
+  // Active DoorDash Drive account, if the restaurant has connected one — see
+  // CLAUDE.md "DoorDash Drive". priceCart uses it to fetch a live quote for
+  // this exact dropoff instead of the flat delivery_fee_cents; restaurants
+  // with no account keep today's flat-fee behavior unchanged.
+  let deliveryAccount: RestaurantDeliveryAccount | null = null;
+  if (fulfillmentMode === "delivery") {
+    const { data } = await supabase
+      .from("restaurant_delivery_accounts")
+      .select("*")
+      .eq("restaurant_id", restaurant.id)
+      .eq("provider", "doordash")
+      .eq("is_active", true)
+      .maybeSingle<RestaurantDeliveryAccount>();
+    deliveryAccount = data;
+  }
+
+  const priced = await priceCart(
+    restaurant,
+    cart,
+    fulfillmentMode,
+    deliveryAccount,
+    fulfillmentMode === "delivery" && delivery
+      ? { address1: delivery.address1 ?? "", city: delivery.city ?? "", province: delivery.province ?? "", postal: delivery.postal ?? "" }
+      : null,
+  );
   if (priced.unavailableNames.length > 0) {
     return NextResponse.json(
       { error: `No longer available: ${priced.unavailableNames.join(", ")}. Please remove from your cart and try again.` },

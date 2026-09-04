@@ -88,6 +88,28 @@ export type PromoCode = {
   created_at: string;
 };
 
+// Per-restaurant DoorDash Drive credentials — see CLAUDE.md "DoorDash Drive".
+// signing_secret is a real secret: never pass a value of this type into a
+// Client Component prop.
+export type RestaurantDeliveryAccount = {
+  id: string;
+  restaurant_id: string;
+  provider: "doordash";
+  developer_id: string;
+  key_id: string;
+  signing_secret: string;
+  pickup_business_name: string;
+  pickup_phone: string;
+  pickup_address_line1: string;
+  pickup_address_line2: string | null;
+  pickup_city: string;
+  pickup_province: string;
+  pickup_postal_code: string;
+  pickup_country: string;
+  is_active: boolean;
+  created_at: string;
+};
+
 export type OrderStatus = "pending" | "paid" | "preparing" | "ready" | "completed" | "cancelled";
 
 export type OrderItem = {
@@ -125,6 +147,15 @@ export type Order = {
   // Stripe's own Refund.status — the source of truth for whether the money
   // actually moved, kept in sync by the refund.updated/refund.failed webhook.
   refund_status: "pending" | "requires_action" | "succeeded" | "failed" | "canceled" | null;
+  // DoorDash Drive dispatch state — set by dispatchDeliveryAction, kept in
+  // sync afterward by src/app/api/webhooks/doordash/route.ts. dispatch_status
+  // is DoorDash's own event_name value, independent of `status` above.
+  dispatch_provider: "doordash" | null;
+  dispatch_external_delivery_id: string | null;
+  dispatch_status: string | null;
+  dispatch_tracking_url: string | null;
+  dispatch_fee_cents: number | null;
+  dispatched_at: string | null;
   created_at: string;
   order_items?: OrderItem[];
 };

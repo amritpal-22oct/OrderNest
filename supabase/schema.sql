@@ -157,6 +157,29 @@ create table orders (
   -- actual source of truth for "did the money move," independent of `status`
   -- above, which stays 'cancelled' regardless of how the refund resolves.
   refund_status text,
+  -- DoorDash Drive dispatch state (see CLAUDE.md "DoorDash Drive" section).
+  -- Set by dispatchDeliveryAction (src/app/admin/[slug]/actions.ts) when an
+  -- admin manually dispatches a courier, kept in sync afterward by
+  -- src/app/api/webhooks/doordash/route.ts — same "separate field, webhook-
+  -- synced" pattern as refund_status above; dispatch_status is DoorDash's own
+  -- event_name enum, never mapped into `status`. dispatch_fee_cents is what
+  -- DoorDash actually charged the restaurant's card, for their own reference
+  -- only — it does NOT affect delivery_fee_cents/total_cents, which reflect
+  -- what the customer was already charged (a live quote at checkout time when
+  -- available, see cart-pricing.ts — intentionally decoupled from the actual
+  -- dispatch cost, since a quote can go stale between checkout and dispatch).
+  -- No CHECK constraint on the value on purpose — loosened so a second
+  -- delivery provider (e.g. Uber Direct) can be added later without another
+  -- migration just to allow the value. Application code still only ever
+  -- writes/reads 'doordash' today (see CLAUDE.md "DoorDash Drive") — this is
+  -- schema-level forward-compatibility only, not a functional multi-provider
+  -- implementation.
+  dispatch_provider text,
+  dispatch_external_delivery_id text,
+  dispatch_status text,
+  dispatch_tracking_url text,
+  dispatch_fee_cents integer,
+  dispatched_at timestamptz,
   created_at timestamptz not null default now()
 );
 
@@ -176,6 +199,46 @@ create table promo_codes (
   is_active boolean not null default true,
   created_at timestamptz not null default now(),
   unique (restaurant_id, code)
+);
+
+-- Per-restaurant DoorDash Drive credentials (see CLAUDE.md "DoorDash Drive"
+-- section). Each restaurant brings its own DoorDash developer account — same
+-- reasoning as stripe_account_id: OrderNest must never sit in the flow of
+-- funds, and DoorDash bills whoever's credentials placed the delivery
+-- request directly. Unlike stripe_account_id, these ARE secrets, not just an
+-- identifier — the first per-tenant secret ever stored in this app's DB.
+-- Modeled on promo_codes below: own table, no public select policy, stored
+-- plain text behind RLS rather than app-layer-encrypted (no encryption
+-- helper exists anywhere in this codebase, and a symmetric key would just
+-- live in another env var — the same trust root RLS already depends on, so
+-- it wouldn't raise the bar against the realistic threat of a compromised
+-- service-role key or DB dump).
+create table restaurant_delivery_accounts (
+  id uuid primary key default gen_random_uuid(),
+  restaurant_id uuid not null references restaurants(id) on delete cascade,
+  -- No CHECK constraint on the value, same reasoning as orders.dispatch_provider above.
+  provider text not null default 'doordash',
+  developer_id text not null,
+  key_id text not null,
+  signing_secret text not null,
+  -- Pickup identity captured independently of restaurant_locations, which
+  -- can have zero rows (no address stored anywhere for a restaurant that's
+  -- never used the multi-location feature). Prefilled from the first active
+  -- restaurant_locations row at setup time when one exists — prefill only,
+  -- never kept in sync afterward. Sent as raw pickup_* fields on every
+  -- DoorDash quote/delivery request; no separate DoorDash "business"/"store"
+  -- registration call is needed for that.
+  pickup_business_name text not null,
+  pickup_phone text not null,
+  pickup_address_line1 text not null,
+  pickup_address_line2 text,
+  pickup_city text not null,
+  pickup_province text not null,
+  pickup_postal_code text not null,
+  pickup_country text not null default 'CA',
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  unique (restaurant_id, provider)
 );
 
 create table order_items (
@@ -199,7 +262,11 @@ create index orders_restaurant_id_created_at_idx on orders (restaurant_id, creat
 create index orders_location_id_idx on orders (location_id);
 -- Enforces webhook idempotency: checkout.session.completed retries must not create duplicate orders.
 create unique index orders_stripe_checkout_session_id_key on orders (stripe_checkout_session_id) where stripe_checkout_session_id is not null;
+-- Prevents double-dispatch and gives the DoorDash webhook a reliable lookup
+-- key back to the order, same shape as the Stripe session index above.
+create unique index orders_dispatch_external_delivery_id_key on orders (dispatch_external_delivery_id) where dispatch_external_delivery_id is not null;
 create index order_items_order_id_idx on order_items (order_id);
+create index restaurant_delivery_accounts_restaurant_id_idx on restaurant_delivery_accounts (restaurant_id);
 
 -- ---------- Row Level Security ----------
 
@@ -208,6 +275,7 @@ alter table restaurants enable row level security;
 alter table restaurant_locations enable row level security;
 alter table restaurant_hours enable row level security;
 alter table promo_codes enable row level security;
+alter table restaurant_delivery_accounts enable row level security;
 alter table restaurant_admins enable row level security;
 alter table menu_categories enable row level security;
 alter table menu_items enable row level security;
@@ -251,6 +319,13 @@ create policy "restaurant admins manage their hours" on restaurant_hours
 -- anonymous customers. Validation at checkout goes through a service-role
 -- route (src/lib/promo.ts), same sanctioned bypass /api/onboard already uses.
 create policy "restaurant admins manage their promo codes" on promo_codes
+  for all using (is_restaurant_admin(restaurant_id)) with check (is_restaurant_admin(restaurant_id));
+
+-- No public select policy on purpose — same reasoning as promo_codes above:
+-- developer_id/key_id/signing_secret must never be scrapeable. Dispatch and
+-- webhook code always go through createAdminClient() (service role), same as
+-- every other trusted-server-only write path in this app.
+create policy "restaurant admins manage their delivery accounts" on restaurant_delivery_accounts
   for all using (is_restaurant_admin(restaurant_id)) with check (is_restaurant_admin(restaurant_id));
 
 create policy "admins see their own restaurant_admins rows" on restaurant_admins

@@ -1,7 +1,10 @@
 import { createClient } from "@/lib/supabase/server";
+import { getDeliveryQuote, type DeliveryAccount } from "@/lib/doordash";
 import type { Restaurant } from "@/lib/types";
 
 export type PricedLine = { name: string; unitAmountCents: number; quantity: number };
+
+export type DeliveryAddressInput = { address1: string; city: string; province: string; postal: string };
 
 export type PricedCart = {
   lines: PricedLine[];
@@ -25,7 +28,15 @@ export type PricedCart = {
 export async function priceCart(
   restaurant: Restaurant,
   cart: Record<string, number>,
-  fulfillmentMode: "delivery" | "pickup"
+  fulfillmentMode: "delivery" | "pickup",
+  // When present (restaurant has an active DoorDash Drive account) and the
+  // order is delivery, deliveryFeeCents is a live DoorDash quote for this
+  // exact dropoff instead of the flat restaurants.delivery_fee_cents — see
+  // CLAUDE.md "DoorDash Drive". Any quote failure (network error, address
+  // outside DoorDash's coverage) falls back to the flat fee; priceCart must
+  // never throw because DoorDash was unreachable.
+  deliveryAccount?: DeliveryAccount | null,
+  deliveryAddress?: DeliveryAddressInput | null
 ): Promise<PricedCart> {
   const supabase = await createClient();
   const ids = Object.keys(cart);
@@ -53,8 +64,18 @@ export async function priceCart(
 
   const isDelivery = fulfillmentMode === "delivery";
   const freeThreshold = restaurant.free_delivery_threshold_cents;
-  const deliveryFeeCents =
-    isDelivery && (freeThreshold === null || subtotalCents < freeThreshold) ? restaurant.delivery_fee_cents : 0;
+  const waived = freeThreshold !== null && subtotalCents >= freeThreshold;
+  let deliveryFeeCents = isDelivery && !waived ? restaurant.delivery_fee_cents : 0;
+
+  if (isDelivery && !waived && deliveryAccount && deliveryAddress) {
+    try {
+      const quote = await getDeliveryQuote(deliveryAccount, deliveryAddress);
+      deliveryFeeCents = quote.feeCents;
+    } catch (err) {
+      console.error("DoorDash quote failed, falling back to flat delivery fee:", err instanceof Error ? err.message : err);
+    }
+  }
+
   const taxCents = Math.round((subtotalCents + deliveryFeeCents) * Number(restaurant.tax_rate));
 
   return {

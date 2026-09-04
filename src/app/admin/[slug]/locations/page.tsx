@@ -1,6 +1,6 @@
-import Link from "next/link";
 import { requireRestaurantAdmin } from "@/lib/restaurant";
 import type { RestaurantLocation } from "@/lib/types";
+import { AdminHeader } from "../AdminHeader";
 import {
   addLocationAction,
   deleteLocationAction,
@@ -11,7 +11,7 @@ import {
 
 export default async function LocationsManagementPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const { supabase, restaurant } = await requireRestaurantAdmin(slug);
+  const { supabase, restaurant, user, role } = await requireRestaurantAdmin(slug);
 
   const { data: locations } = await supabase
     .from("restaurant_locations")
@@ -23,28 +23,7 @@ export default async function LocationsManagementPage({ params }: { params: Prom
 
   return (
     <div className="min-h-screen bg-neutral-50">
-      <header className="border-b border-neutral-200 bg-white">
-        <div className="mx-auto flex max-w-3xl items-center justify-between px-6 py-4">
-          <div>
-            <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name}</h1>
-            <p className="text-sm text-neutral-500">Locations</p>
-          </div>
-          <div className="flex items-center gap-4">
-            <Link href={`/admin/${slug}/menu`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Menu
-            </Link>
-            <Link href={`/admin/${slug}/hours`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Hours
-            </Link>
-            <Link href={`/admin/${slug}/promo`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Promo codes
-            </Link>
-            <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              ← Orders
-            </Link>
-          </div>
-        </div>
-      </header>
+      <AdminHeader slug={slug} restaurant={restaurant} userEmail={user.email ?? ""} role={role} active="locations" />
 
       <main className="mx-auto max-w-3xl space-y-6 px-6 py-8">
         <section className="rounded-xl border border-neutral-200 bg-white p-5">

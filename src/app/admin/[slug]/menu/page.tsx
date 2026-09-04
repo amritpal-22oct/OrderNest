@@ -1,8 +1,8 @@
-import Link from "next/link";
 import { requireRestaurantAdmin } from "@/lib/restaurant";
 import { money } from "@/lib/format";
 import type { MenuCategory, MenuItem } from "@/lib/types";
 import { ImageUploadField } from "./ImageUploadField";
+import { AdminHeader } from "../AdminHeader";
 import {
   addCategoryAction,
   addItemAction,
@@ -14,7 +14,7 @@ import {
 
 export default async function MenuManagementPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const { supabase, restaurant } = await requireRestaurantAdmin(slug);
+  const { supabase, restaurant, user, role } = await requireRestaurantAdmin(slug);
 
   const [{ data: categories }, { data: items }] = await Promise.all([
     supabase.from("menu_categories").select("*").eq("restaurant_id", restaurant.id).order("sort_order").returns<MenuCategory[]>(),
@@ -34,28 +34,7 @@ export default async function MenuManagementPage({ params }: { params: Promise<{
 
   return (
     <div className="min-h-screen bg-neutral-50">
-      <header className="border-b border-neutral-200 bg-white">
-        <div className="mx-auto flex max-w-3xl items-center justify-between px-6 py-4">
-          <div>
-            <h1 className="text-lg font-semibold text-neutral-900">{restaurant.name}</h1>
-            <p className="text-sm text-neutral-500">Menu</p>
-          </div>
-          <div className="flex items-center gap-4">
-            <Link href={`/admin/${slug}/locations`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Locations
-            </Link>
-            <Link href={`/admin/${slug}/hours`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Hours
-            </Link>
-            <Link href={`/admin/${slug}/promo`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              Promo codes
-            </Link>
-            <Link href={`/admin/${slug}`} className="text-sm text-neutral-500 hover:text-neutral-900">
-              ← Orders
-            </Link>
-          </div>
-        </div>
-      </header>
+      <AdminHeader slug={slug} restaurant={restaurant} userEmail={user.email ?? ""} role={role} active="menu" />
 
       <main className="mx-auto max-w-3xl space-y-6 px-6 py-8">
         {(categories ?? []).map((category) => (

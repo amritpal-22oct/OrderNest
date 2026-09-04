@@ -19,8 +19,10 @@ export function AcceptingOrdersToggle({ slug, acceptingOrders }: { slug: string;
       <input type="hidden" name="next" value={(!acceptingOrders).toString()} />
       <button
         type="submit"
-        className={`rounded-md px-3 py-1.5 text-sm font-medium ${
-          acceptingOrders ? "border border-neutral-300 text-neutral-700 hover:bg-neutral-50" : "bg-amber-600 text-white hover:bg-amber-700"
+        className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
+          acceptingOrders
+            ? "border-red-300 text-red-600 hover:bg-red-50"
+            : "border-transparent bg-green-600 text-white hover:bg-green-700"
         }`}
       >
         {acceptingOrders ? "Pause ordering" : "Resume ordering"}

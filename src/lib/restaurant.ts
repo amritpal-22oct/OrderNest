@@ -36,7 +36,7 @@ export async function requireRestaurantAdmin(slug: string) {
 
   const { data: membership } = await supabase
     .from("restaurant_admins")
-    .select("id")
+    .select("id, role")
     .eq("restaurant_id", restaurant.id)
     .eq("user_id", user.id)
     .maybeSingle();
@@ -51,5 +51,13 @@ export async function requireRestaurantAdmin(slug: string) {
     redirect(`/admin/${slug}/login?error=not-authorized`);
   }
 
-  return { supabase, user, restaurant };
+  // Platform admins aren't a restaurant_admins row at all (RLS's
+  // is_platform_admin() is what actually grants them access), so they have
+  // no `role` to read — treat them as owner-equivalent rather than gating
+  // owner-only actions (like opening the connected account's Stripe
+  // Dashboard) away from the one login that can already see every
+  // restaurant's data anyway.
+  const role = membership?.role ?? "owner";
+
+  return { supabase, user, restaurant, role };
 }

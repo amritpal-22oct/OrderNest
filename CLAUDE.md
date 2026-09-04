@@ -291,6 +291,90 @@ fires per keystroke rather than once per checkout.
 so newly-added locations render **first** in the admin list, not last — the admin query orders by
 `sort_order, created_at` to keep this predictable rather than surprising.
 
+## DoorDash Drive (read before touching `src/lib/doordash.ts` or `/admin/[slug]/delivery`)
+
+Lets a restaurant with no delivery drivers of its own offer delivery anyway, dispatched through
+DoorDash's courier network. **Bring-your-own-account, not a platform-wide DoorDash account** —
+each restaurant signs up for its own DoorDash Drive developer account outside OrderNest and pastes
+its Developer ID / Key ID / Signing Secret into `/admin/[slug]/delivery`. This is the same reasoning
+as Stripe Connect above: DoorDash bills whichever credentials placed the delivery request directly
+(no Connect-style split billing exists for delivery networks), so bring-your-own-account keeps
+DoorDash billing the restaurant's own card, never OrderNest's — OrderNest must never sit in the flow
+of funds, for delivery money any more than for food money.
+
+**`restaurant_delivery_accounts` stores real secrets in plain text, deliberately** — the first
+per-tenant secret ever stored in this app's DB (`stripe_account_id`/`stripe_customer_id` are
+identifiers, not secrets). Modeled on `promo_codes`: its own table, **no public select policy**, only
+`is_restaurant_admin(restaurant_id)`. No app-layer encryption was added: this codebase has zero
+encryption infrastructure today, and a symmetric key would just live in another env var — the same
+trust root RLS already depends on — so it wouldn't raise the bar against the realistic threat (a
+compromised service-role key or DB dump defeats app-layer encryption-with-a-static-key exactly as
+easily as it defeats RLS). Revisit with a Vault-based approach only if a real compliance requirement
+ever demands encryption-at-rest specifically for this class of secret.
+
+**Pickup address is captured independently of `restaurant_locations`**, on the setup form itself —
+`restaurant_locations` can have zero rows (see "Zero or one location = skip entirely" above), so
+there's otherwise no pickup address stored anywhere for most restaurants. Prefilled from the first
+active `restaurant_locations` row when one exists, but it's a one-time prefill, never a live link.
+v1 supports exactly one DoorDash pickup point per restaurant, matching `delivery_fee_cents` already
+being restaurant-wide rather than per-location. No DoorDash "business"/"store" registration call is
+needed — pickup fields are sent raw on every quote/delivery request instead.
+
+**Delivery fee is a live DoorDash quote when connected, not a flat number.** `priceCart()`
+(`src/lib/cart-pricing.ts`) calls DoorDash's Create Quote (pickup = the account's own pickup fields,
+dropoff = the address just collected at checkout) and uses the real, distance-based `fee` in place of
+`restaurants.delivery_fee_cents` whenever a restaurant has an active `restaurant_delivery_accounts`
+row and the order is delivery. Restaurants with no account keep the flat-fee behavior unchanged. The
+quote is fetched for pricing only and is **never Accepted at checkout time** — DoorDash quotes are
+valid ~5 minutes, shorter than a safe bound on how long payment entry can take, so accepting early
+would risk dispatching a courier before payment is even confirmed. Any quote failure (DoorDash
+unreachable, address outside coverage) is caught inside `priceCart()` and falls back to the flat fee
+— checkout must never break because DoorDash was down. Actual dispatch later calls Create Delivery
+fresh and may get a different real price than what the customer was quoted/charged; that gap —
+including the much larger one possible for scheduled/future orders, where DoorDash has no way to
+lock in pricing days ahead — is the restaurant's own risk, same as any live-pricing delivery
+integration. `orders.dispatch_fee_cents` records what DoorDash actually charged, for the restaurant's
+own reference only; it never affects `total_cents`, which reflects what the customer already paid.
+
+**Dispatch is manual, not automatic inside the Stripe webhook.** An admin clicks "Dispatch to
+DoorDash" on a paid delivery order (`dispatchDeliveryAction` in `src/app/admin/[slug]/actions.ts`,
+`DispatchDeliveryButton.tsx` — same confirm()-gated pattern as the refund button) to call Create
+Delivery. Keeps `fulfillOrder()` (the Stripe webhook) single-purpose — order creation only — and
+puts any DoorDash failure in front of a human immediately rather than silently retrying inside a
+payment webhook's retry contract, which is built around Stripe's own semantics, not DoorDash's.
+Idempotency guard: `orders.dispatch_external_delivery_id` must be null before dispatching, backed by
+a partial unique index, same shape as `orders_stripe_checkout_session_id_key`.
+
+**JWT auth, confirmed against developer.doordash.com this session** (`src/lib/doordash.ts`): header
+`{alg: "HS256", typ: "JWT", "dd-ver": "DD-JWT-V1"}`, payload `{aud: "doordash", iss: developer_id,
+kid: key_id, iat, exp}`, HS256-signed over a **base64url-decoded** signing secret (not the raw
+secret string — confirmed via DoorDash's own Node.js sample code; this is an easy mistake to make).
+Sent as `Authorization: Bearer <jwt>` against `https://openapi.doordash.com`. Uses the `jsonwebtoken`
+package (matches DoorDash's own sample) rather than hand-rolling HMAC with Node's `crypto` — the
+base64url-decode-before-sign nuance is exactly the kind of subtle bug a hand-rolled implementation
+risks getting wrong silently.
+
+**Webhooks have no signature scheme — Basic Auth/OAuth instead, confirmed against DoorDash's docs
+this session.** Unlike Stripe (HMAC signatures on every event), DoorDash Drive lets the developer
+choose the literal value DoorDash will send back in the `Authorization` header on every webhook
+call, configured per-developer-account in DoorDash's own portal. This app uses one platform-wide
+value, `DOORDASH_WEBHOOK_AUTH_TOKEN`, that every restaurant's DoorDash portal is configured to send
+— simpler than a per-restaurant secret, and this value only proves "this request really came from
+DoorDash," it doesn't gate anything restaurant-specific (RLS/service-role client handle that, same
+as every other webhook here). `/admin/[slug]/delivery` shows the exact endpoint URL and header value
+an owner needs to paste into their DoorDash Developer Portal. `src/app/api/webhooks/doordash/route.ts`
+verifies with a constant-time compare (`crypto.timingSafeEqual`), then maps the event to an order via
+`external_delivery_id` — which OrderNest itself set to the order's own `id` at dispatch time, so
+(unlike the Stripe Connect webhook, which has no OrderNest id to key on at all) this route can match
+directly rather than needing a lookup-by-external-id.
+
+**What's unverified against a live sandbox call**: the doc research above came from DoorDash's public
+developer docs, not an actual test API call — exact optional field names beyond what
+`src/lib/doordash.ts` already sends (e.g. `dropoff_instructions`, `order_value`) are the
+commonly-documented names but haven't been confirmed end-to-end the way the Stripe Connect account
+flow was (see its "Verified working end-to-end" note above). Worth a real sandbox delivery before
+depending on anything beyond what's already wired up.
+
 ## Hours of operation
 
 Per-restaurant, per-day-of-week schedule (`restaurant_hours`: `day_of_week` 0=Sunday..6=Saturday,
@@ -405,7 +489,19 @@ another third-party `<Script>` with client state gated on load, use `onReady`, n
   Checkout & webhook and Stripe Connect sections above.
 - `/admin/[slug]` and `/admin/[slug]/login` — restaurant admin orders dashboard (**built**:
   email/password login via Supabase Auth, orders list with status updates, RLS-gated).
-  Also shows a "Connect Stripe" banner/button when `stripe_onboarding_complete` is false.
+  Also shows a "Connect Stripe" banner/button when `stripe_onboarding_complete` is false, and a
+  "Stripe Dashboard" link (once connected) that generates a single-use Express Dashboard login
+  link via `stripe.accounts.createLoginLink(accountId)` and redirects there — the v1-shaped
+  method is intentional, there's no v2-specific login-link endpoint in the installed SDK, and v1
+  and v2 coexist for operations v2 doesn't have its own version of (see Stripe Connect section
+  for the same pattern elsewhere). **Both are owner-only**, gated on `restaurant_admins.role`
+  (now read and returned by `requireRestaurantAdmin()` — see `src/lib/restaurant.ts`): Stripe's
+  own OTP to the account holder's phone/email is a real second factor once someone reaches the
+  button, but it doesn't decide who should be allowed to click it from inside OrderNest in the
+  first place, and both actions reach money-moving controls (payout bank account, manual
+  payouts, refunds depending on which Express features are enabled) that a `staff` login
+  shouldn't have. A `staff` admin sees the same order/menu/hours/locations/promo access as an
+  owner — the role split is Stripe-account access only, not a broader permissions system.
   Search/filter (customer name via `ilike`, date range, status, fulfillment mode, and location when
   the restaurant has any) plus pagination (20/page, `range()` + `{count:"exact"}`) all live in plain
   `?query` params via a GET `<form>` — no client JS, no Server Action, just navigation, so it's
@@ -458,6 +554,10 @@ another third-party `<Script>` with client state gated on load, use `onReady`, n
   for an instant preview) and the authoritative re-check inside `/api/checkout` itself before the
   Stripe session is created — same "client preview, server re-validates" pattern as pricing and the
   delivery-radius/hours checks elsewhere in checkout.
+- `/admin/[slug]/delivery` and `/api/webhooks/doordash` — **built**: bring-your-own-account DoorDash
+  Drive setup (owner-only credential form + webhook setup instructions) and dispatch status webhook —
+  see "DoorDash Drive" above. Not yet verified end-to-end against a real DoorDash sandbox call (build
+  + typecheck + lint pass; no live API credentials were available in this session).
 - `/platform-admin` and `/platform-admin/login` — **built**: cross-restaurant super-admin view.
   `requirePlatformAdmin()` (`src/lib/platform-admin.ts`) gates the page; RLS's
   `is_platform_admin()` (used inside `is_restaurant_admin()`) is what actually grants the
@@ -465,6 +565,33 @@ another third-party `<Script>` with client state gated on load, use `onReady`, n
   restaurant with Stripe connection status, order count, and revenue (aggregated client-side
   from a single cross-tenant `orders` query), plus a Dashboard link into each restaurant's
   `/admin/[slug]`. Verified end-to-end via browser + DB checks.
+  Each restaurant row also lists its current admins (email + role, resolved from
+  `restaurant_admins.user_id` via the service-role client — the session client has no access to
+  `auth.users`) and an inline "Add" form (`addRestaurantAdminAction` in
+  `platform-admin/actions.ts`) that's the **one place all account changes happen** — new admin,
+  role change, and password reset alike, by explicit product decision (no self-serve
+  forgot-password or owner-invites-staff flow — see "Not built yet" for the full reasoning). An
+  email that already has an OrderNest login just gets linked/re-roled (leave the password field
+  blank); filling the password field on an existing login resets it instead — that's the sanctioned
+  "I forgot my password" path. An email with no existing login requires the platform admin to set
+  an initial password directly — mirrors `/api/onboard`'s own pattern for the initial owner,
+  deliberately, since there's no accept-invite/set-password page built yet for
+  `inviteUserByEmail`'s emailed link to land on. This is the piece that makes the `role`-gated
+  Stripe Dashboard access above actually usable: previously nothing anywhere could add a second
+  admin to an existing restaurant at all (`/api/onboard` only ever creates the initial `owner`).
+
+  **The "email" field doesn't have to be a real, deliverable address — explicit product
+  decision, not a workaround to fix.** Supabase Auth's password login only has email/phone as
+  built-in identity types, no native username — but since this app never sends anything to that
+  address (no invite emails, no password-reset emails, both deliberately absent per the point
+  above), a platform admin can type any unique `@`-shaped string as a login "username" (e.g.
+  `jsmith@mithaascafe.staff`) and it works exactly like one. Don't build a real username column
+  or a synthetic-email mapping layer for this without being asked — the fake-email pattern
+  already covers it with zero extra code.
+  Verified end-to-end via browser: created a `staff` login this way, signed in as it, and
+  confirmed the "Connect Stripe"/"Stripe Dashboard" controls were absent while every
+  other admin page still worked normally — throwaway test login cleaned up (`delete from
+  auth.users ...`, cascades to its `restaurant_admins` row) after.
 
 ## Local dev
 
@@ -515,12 +642,18 @@ another third-party `<Script>` with client state gated on load, use `onReady`, n
    currency, etc. exist as DB columns (read by checkout/menu pages) but have no admin UI; only
    editable by hand via SQL/seed today. (`delivery_radius_km` and `timezone` are the exceptions —
    editable from `/admin/[slug]/locations` and `/admin/[slug]/hours` respectively.)
-3. **Auth completeness** — no password reset flow, no way to invite a second admin to an existing
-   restaurant (`restaurant_admins` supports multiple rows, but only onboarding's initial owner
-   insert exists). `/onboard` itself is no longer public (platform-admin-gated), but
-   `/api/geocode` and `/api/geocode/suggest` are still public with **no rate limiting** — lower
-   stakes than the pre-fix `/onboard` gap (Mapbox quota cost, not account creation) but worse for
-   `/suggest` specifically since it fires per keystroke, not once per checkout.
+3. **No self-serve account management — explicit product decision, not a gap**: there's
+   deliberately no forgot-password flow and no way for a restaurant owner to invite their own
+   staff. Every account change (new admin logins, role changes, forgotten passwords) goes through
+   a platform admin instead, via `/platform-admin`'s admin list + add/reset form — see that route
+   above. Don't build self-serve password reset or owner-initiated invites without being asked;
+   this was a direct instruction, not a placeholder waiting to be filled in. (The one still-rough
+   edge, not a scope decision: a brand-new login's password is set directly by the platform admin
+   rather than emailed as a real invite link, since no accept-invite page exists to land one on.)
+   `/onboard` itself is no longer public (platform-admin-gated), but `/api/geocode` and
+   `/api/geocode/suggest` are still public with **no rate limiting** — lower stakes than the
+   pre-fix `/onboard` gap (Mapbox quota cost, not account creation) but worse for `/suggest`
+   specifically since it fires per keystroke, not once per checkout.
 4. **Order lifecycle beyond "paid"** — an admin can set an order's status to `cancelled`, but that's
    just a label on the row; there's no actual Stripe refund/void wired to it, and no customer-facing
    notification (email/SMS) of any status change.

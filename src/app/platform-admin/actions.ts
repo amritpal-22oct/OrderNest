@@ -12,6 +12,79 @@ export async function signOutAction() {
   redirect("/platform-admin/login");
 }
 
+// Adds (or re-roles) an admin login for an existing restaurant — the missing
+// piece noted in CLAUDE.md's "Auth completeness" gap: /api/onboard only ever
+// creates the initial `owner` row for a brand-new restaurant, and nothing
+// anywhere could add a second admin to one that already exists.
+//
+// Also doubles as the password-reset mechanism: OrderNest has no self-serve
+// forgot-password flow by explicit product decision — every account change
+// (new logins, role changes, forgotten passwords alike) goes through a
+// platform admin here instead. So a non-empty password field on an existing
+// login means "reset it", not just "re-link/re-role them" — see the
+// `password && userId` branch below.
+//
+// No invite-email flow exists either (no accept-invite/set-password page to
+// land an emailed link on), so a brand-new login's password is set directly
+// by the platform admin (shared with the new admin out of band) rather than
+// Supabase emailing a half-working invite link with nowhere to land.
+export async function addRestaurantAdminAction(formData: FormData) {
+  const restaurantId = formData.get("restaurantId") as string;
+  const email = (formData.get("email") as string | null)?.trim().toLowerCase();
+  const password = (formData.get("password") as string | null) ?? "";
+  const role = formData.get("role") === "staff" ? "staff" : "owner";
+
+  if (!email) {
+    redirect(`/platform-admin?adminError=${encodeURIComponent("Email is required.")}`);
+  }
+
+  const adminClient = createAdminClient();
+
+  // The installed supabase-js version's listUsers() has no email filter, so
+  // an existing-login check means paging through and matching client-side.
+  // Fine at this app's platform-wide user count; would need a real filter
+  // (or a users-by-email lookup table) if that stops being true.
+  let userId: string | undefined;
+  for (let page = 1; !userId; page++) {
+    const { data, error } = await adminClient.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error || data.users.length === 0) break;
+    userId = data.users.find((u) => u.email?.toLowerCase() === email)?.id;
+    if (data.users.length < 1000) break;
+  }
+
+  if (!userId) {
+    if (password.length < 8) {
+      redirect(
+        `/platform-admin?adminError=${encodeURIComponent("That email has no existing OrderNest login — set an initial password (8+ characters) to create one.")}`,
+      );
+    }
+    const { data, error } = await adminClient.auth.admin.createUser({ email, password, email_confirm: true });
+    if (error || !data.user) {
+      redirect(`/platform-admin?adminError=${encodeURIComponent(error?.message ?? "Couldn't create that login.")}`);
+    } else {
+      userId = data.user.id;
+    }
+  } else if (password) {
+    if (password.length < 8) {
+      redirect(`/platform-admin?adminError=${encodeURIComponent("Password must be 8+ characters.")}`);
+    }
+    const { error } = await adminClient.auth.admin.updateUserById(userId, { password });
+    if (error) {
+      redirect(`/platform-admin?adminError=${encodeURIComponent(error.message)}`);
+    }
+  }
+
+  const supabase = await createClient();
+  const { error: linkError } = await supabase
+    .from("restaurant_admins")
+    .upsert({ restaurant_id: restaurantId, user_id: userId, role }, { onConflict: "restaurant_id,user_id" });
+  if (linkError) {
+    redirect(`/platform-admin?adminError=${encodeURIComponent(linkError.message)}`);
+  }
+
+  revalidatePath("/platform-admin");
+}
+
 // Saves the platform-billing Stripe Customer id (cus_...) a platform admin
 // created by hand in the Stripe Dashboard, so the dashboard below can look up
 // live subscription status instead of tracking it manually in the app.
